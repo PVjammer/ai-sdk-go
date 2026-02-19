@@ -18,6 +18,11 @@ type StreamChunk struct {
 	// Text is the generated text in this chunk.
 	Text string
 
+	// ToolCalls contains tool invocations requested by the model (native tool calling).
+	// When non-empty, this is a tool-calling response; Text may be empty.
+	// Only set on the final chunk (Done=true).
+	ToolCalls []ToolCall
+
 	// Done indicates this is the final chunk.
 	Done bool
 
@@ -87,6 +92,18 @@ type ChatMessage struct {
 
 	// Content is the message text
 	Content string
+
+	// ToolCalls contains tool invocations for assistant messages that request tool use.
+	// Only set when Role="assistant" and the model is requesting tool calls.
+	ToolCalls []ToolCall
+
+	// ToolCallID is the ID of the tool call this message responds to.
+	// Set when Role="tool" to link the result back to the original tool call.
+	ToolCallID string
+
+	// ToolName is the name of the tool for tool result messages.
+	// Set when Role="tool".
+	ToolName string
 }
 
 // ConversationProvider extends Provider with multi-message conversation support.

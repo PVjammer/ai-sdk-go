@@ -79,6 +79,7 @@ or called programmatically via the Go API.`,
 	rootCmd.AddCommand(createListCommand())
 	rootCmd.AddCommand(createInitCommand())
 	rootCmd.AddCommand(createConfigCommand())
+	rootCmd.AddCommand(createChatCommand())
 
 	// Auto-discover and add function commands
 	addFunctionCommands(rootCmd)

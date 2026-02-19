@@ -2,6 +2,7 @@ package llm
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -13,6 +14,7 @@ import (
 // Compile-time interface checks
 var _ Provider = (*OllamaProvider)(nil)
 var _ ConversationProvider = (*OllamaProvider)(nil)
+var _ ToolCallingProvider = (*OllamaProvider)(nil)
 
 // OllamaProvider implements the Provider interface for Ollama.
 //
@@ -338,10 +340,29 @@ func (p *OllamaProvider) ChatMessages(ctx context.Context, messages []ChatMessag
 		// Convert ChatMessage to api.Message
 		apiMessages := make([]api.Message, len(messages))
 		for i, msg := range messages {
-			apiMessages[i] = api.Message{
-				Role:    msg.Role,
-				Content: msg.Content,
+			apiMsg := api.Message{
+				Role:       msg.Role,
+				Content:    msg.Content,
+				ToolCallID: msg.ToolCallID,
+				ToolName:   msg.ToolName,
 			}
+			// Convert tool calls if present (for assistant messages requesting tools)
+			if len(msg.ToolCalls) > 0 {
+				for _, tc := range msg.ToolCalls {
+					args := api.NewToolCallFunctionArguments()
+					for k, v := range tc.Args {
+						args.Set(k, v)
+					}
+					apiMsg.ToolCalls = append(apiMsg.ToolCalls, api.ToolCall{
+						ID: tc.ID,
+						Function: api.ToolCallFunction{
+							Name:      tc.Name,
+							Arguments: args,
+						},
+					})
+				}
+			}
+			apiMessages[i] = apiMsg
 		}
 
 		// Build request
@@ -459,6 +480,178 @@ func (p *OllamaProvider) ChatMessages(ctx context.Context, messages []ChatMessag
 	}()
 
 	return ch
+}
+
+// ChatWithTools implements ToolCallingProvider.
+//
+// It sends the conversation history with structured tool definitions to Ollama.
+// When the model requests tool calls, the final StreamChunk has ToolCalls set.
+// When the model produces a text response, the final StreamChunk has Text set.
+//
+// This method always uses non-streaming mode to ensure complete tool call data.
+func (p *OllamaProvider) ChatWithTools(ctx context.Context, messages []ChatMessage, tools []ToolDef, opts *CompletionOptions) <-chan StreamChunk {
+	ch := make(chan StreamChunk, 10)
+
+	go func() {
+		defer close(ch)
+
+		if opts == nil {
+			opts = DefaultOptions()
+		}
+
+		// Convert ChatMessage slice to api.Message slice (same as ChatMessages)
+		apiMessages := make([]api.Message, 0, len(messages))
+		for _, msg := range messages {
+			apiMsg := api.Message{
+				Role:       msg.Role,
+				Content:    msg.Content,
+				ToolCallID: msg.ToolCallID,
+				ToolName:   msg.ToolName,
+			}
+			if len(msg.ToolCalls) > 0 {
+				for _, tc := range msg.ToolCalls {
+					args := api.NewToolCallFunctionArguments()
+					for k, v := range tc.Args {
+						args.Set(k, v)
+					}
+					apiMsg.ToolCalls = append(apiMsg.ToolCalls, api.ToolCall{
+						ID: tc.ID,
+						Function: api.ToolCallFunction{
+							Name:      tc.Name,
+							Arguments: args,
+						},
+					})
+				}
+			}
+			apiMessages = append(apiMessages, apiMsg)
+		}
+
+		// Convert ToolDef slice to api.Tools
+		apiTools := make(api.Tools, 0, len(tools))
+		for _, td := range tools {
+			params, err := toolDefToOllamaParams(td.Parameters)
+			if err != nil {
+				ch <- StreamChunk{
+					Error: fmt.Errorf("invalid tool parameters for %s: %w", td.Name, err),
+					Done:  true,
+				}
+				return
+			}
+			apiTools = append(apiTools, api.Tool{
+				Type: "function",
+				Function: api.ToolFunction{
+					Name:        td.Name,
+					Description: td.Description,
+					Parameters:  params,
+				},
+			})
+		}
+
+		// Always use non-streaming: tool calls must be complete before execution
+		streamFalse := false
+		req := &api.ChatRequest{
+			Model:    p.model,
+			Messages: apiMessages,
+			Tools:    apiTools,
+			Stream:   &streamFalse,
+			Options: map[string]interface{}{
+				"temperature": opts.Temperature,
+			},
+		}
+
+		if opts.MaxTokens > 0 {
+			req.Options["num_predict"] = opts.MaxTokens
+		}
+		if len(opts.StopWords) > 0 {
+			req.Options["stop"] = opts.StopWords
+		}
+
+		// Accumulate content and tool calls across callbacks
+		// (Ollama may invoke the callback multiple times even in non-streaming mode)
+		var contentBuilder strings.Builder
+		var toolCalls []ToolCall
+		var lastResponse api.ChatResponse
+
+		respFunc := func(resp api.ChatResponse) error {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
+			}
+
+			lastResponse = resp
+
+			if resp.Message.Content != "" {
+				contentBuilder.WriteString(resp.Message.Content)
+			}
+
+			// Collect tool calls from each callback
+			if len(resp.Message.ToolCalls) > 0 {
+				for _, tc := range resp.Message.ToolCalls {
+					toolCalls = append(toolCalls, ToolCall{
+						ID:   tc.ID,
+						Name: tc.Function.Name,
+						Args: tc.Function.Arguments.ToMap(),
+					})
+				}
+			}
+
+			return nil
+		}
+
+		err := p.client.Chat(ctx, req, respFunc)
+		if err != nil {
+			if ctx.Err() != nil {
+				ch <- StreamChunk{Error: ctx.Err(), Done: true}
+				return
+			}
+			if isConnectionError(err) {
+				ch <- StreamChunk{
+					Error: fmt.Errorf("%w: %v", ErrProviderUnavailable, err),
+					Done:  true,
+				}
+				return
+			}
+			ch <- StreamChunk{
+				Error: fmt.Errorf("ollama tool chat failed: %w", err),
+				Done:  true,
+			}
+			return
+		}
+
+		ch <- StreamChunk{
+			Text:             contentBuilder.String(),
+			ToolCalls:        toolCalls,
+			Done:             true,
+			TokensUsed:       lastResponse.PromptEvalCount + lastResponse.EvalCount,
+			PromptTokens:     lastResponse.PromptEvalCount,
+			CompletionTokens: lastResponse.EvalCount,
+			Model:            lastResponse.Model,
+			FinishReason:     mapFinishReason(lastResponse.DoneReason),
+		}
+	}()
+
+	return ch
+}
+
+// toolDefToOllamaParams converts a ToolDef's Parameters (JSON Schema) to
+// Ollama's ToolFunctionParameters by marshal/unmarshal round-trip.
+func toolDefToOllamaParams(params interface{}) (api.ToolFunctionParameters, error) {
+	if params == nil {
+		return api.ToolFunctionParameters{Type: "object"}, nil
+	}
+
+	data, err := json.Marshal(params)
+	if err != nil {
+		return api.ToolFunctionParameters{}, fmt.Errorf("marshal parameters: %w", err)
+	}
+
+	var tfp api.ToolFunctionParameters
+	if err := json.Unmarshal(data, &tfp); err != nil {
+		return api.ToolFunctionParameters{}, fmt.Errorf("unmarshal parameters: %w", err)
+	}
+
+	return tfp, nil
 }
 
 // Name returns the provider identifier.
