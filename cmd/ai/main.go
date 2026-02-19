@@ -13,7 +13,10 @@ import (
 	"github.com/spf13/cobra"
 
 	// Import builtin functions to trigger auto-registration
+	_ "github.com/pvjammer/ai-sdk-go/pkg/builtin/calculator"
 	_ "github.com/pvjammer/ai-sdk-go/pkg/builtin/extract"
+	_ "github.com/pvjammer/ai-sdk-go/pkg/builtin/fileio"
+	_ "github.com/pvjammer/ai-sdk-go/pkg/builtin/httprequest"
 	_ "github.com/pvjammer/ai-sdk-go/pkg/builtin/summarize"
 	_ "github.com/pvjammer/ai-sdk-go/pkg/builtin/texttransform"
 	_ "github.com/pvjammer/ai-sdk-go/pkg/builtin/websearch"
@@ -102,6 +105,7 @@ func registryFunctionDefaults() []config.FunctionDefaults {
 
 		registration := reg.GetRegistration(name)
 		if registration != nil {
+			fd.RequiresApproval = registration.RequiresApproval
 			for _, p := range registration.ConfigParams {
 				fd.Params = append(fd.Params, config.FunctionDefaultParam{
 					Key:     p.Key,

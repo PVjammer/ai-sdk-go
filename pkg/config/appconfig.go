@@ -29,6 +29,20 @@ type AppAgentConfig struct {
 	MaxIterations int     `toml:"max_iterations"`
 	Temperature   float64 `toml:"temperature"`
 	MaxTokens     int     `toml:"max_tokens"`
+
+	// Context management for the SimpleAgent hook system.
+	// ContextTokens is the estimated token limit for session history before
+	// the oldest exchanges are dropped in the PreModel hook (default: 8000).
+	ContextTokens int `toml:"context_tokens"`
+
+	// LargeResultThreshold is the byte size above which a tool result is
+	// written to a temp file and replaced with a file-reference in history
+	// (default: 8192). Set to 0 to disable.
+	LargeResultThreshold int `toml:"large_result_threshold"`
+
+	// DebugHooks enables the Logging hook which writes all six hook points
+	// to stderr. Intended for development; disable in production (default: false).
+	DebugHooks bool `toml:"debug_hooks"`
 }
 
 // FunctionConfig holds per-function settings.
@@ -51,8 +65,9 @@ type FunctionDefaultParam struct {
 
 // FunctionDefaults describes a registered function's name and declared config parameters.
 type FunctionDefaults struct {
-	Name   string
-	Params []FunctionDefaultParam
+	Name             string
+	Params           []FunctionDefaultParam
+	RequiresApproval bool // propagated from registry.Registration
 }
 
 // commonFields are the reserved keys in a function config section.
@@ -130,6 +145,15 @@ func LoadAppConfig(path string) (*AppConfig, error) {
 		if v, ok := tomlInt(agentRaw["max_tokens"]); ok {
 			cfg.Agent.MaxTokens = v
 		}
+		if v, ok := tomlInt(agentRaw["context_tokens"]); ok {
+			cfg.Agent.ContextTokens = v
+		}
+		if v, ok := tomlInt(agentRaw["large_result_threshold"]); ok {
+			cfg.Agent.LargeResultThreshold = v
+		}
+		if v, ok := agentRaw["debug_hooks"].(bool); ok {
+			cfg.Agent.DebugHooks = v
+		}
 	}
 
 	// Parse Functions sections
@@ -206,6 +230,12 @@ func MarshalAppConfig(cfg *AppConfig) string {
 	b.WriteString(fmt.Sprintf("max_iterations = %d\n", cfg.Agent.MaxIterations))
 	b.WriteString(fmt.Sprintf("temperature = %g\n", cfg.Agent.Temperature))
 	b.WriteString(fmt.Sprintf("max_tokens = %d\n", cfg.Agent.MaxTokens))
+	b.WriteString("# Context window token limit for history trimming (PreModel hook)\n")
+	b.WriteString(fmt.Sprintf("context_tokens = %d\n", cfg.Agent.ContextTokens))
+	b.WriteString("# Tool result byte threshold before redirecting to a temp file (PostTool hook)\n")
+	b.WriteString(fmt.Sprintf("large_result_threshold = %d\n", cfg.Agent.LargeResultThreshold))
+	b.WriteString("# Log all hook points to stderr (development only)\n")
+	b.WriteString(fmt.Sprintf("debug_hooks = %t\n", cfg.Agent.DebugHooks))
 	b.WriteString("\n")
 
 	// Functions — sorted by name for deterministic output
@@ -270,9 +300,12 @@ func DefaultAppConfig(funcs []FunctionDefaults) *AppConfig {
 			Model:    "llama3.2:latest",
 		},
 		Agent: AppAgentConfig{
-			MaxIterations: 10,
-			Temperature:   0.7,
-			MaxTokens:     2048,
+			MaxIterations:        10,
+			Temperature:          0.7,
+			MaxTokens:            2048,
+			ContextTokens:        8000,
+			LargeResultThreshold: 8192,
+			DebugHooks:           false,
 		},
 		Functions: make(map[string]FunctionConfig),
 	}
@@ -281,7 +314,7 @@ func DefaultAppConfig(funcs []FunctionDefaults) *AppConfig {
 		fc := FunctionConfig{
 			EnabledCLI:       true,
 			EnabledTool:      true,
-			RequiresApproval: false,
+			RequiresApproval: fd.RequiresApproval,
 			Params:           make(map[string]any),
 		}
 
@@ -295,20 +328,50 @@ func DefaultAppConfig(funcs []FunctionDefaults) *AppConfig {
 	return cfg
 }
 
-// EnsureConfig loads the config from disk, or generates a default
-// if no config file exists.
+// MergeDefaults returns a copy of base with any function sections from defaults
+// that are not already present in base. All existing values in base are preserved
+// — only new function keys are added.
+func MergeDefaults(base, defaults *AppConfig) *AppConfig {
+	merged := &AppConfig{
+		LLM:       base.LLM,
+		Agent:     base.Agent,
+		Functions: make(map[string]FunctionConfig, len(base.Functions)+len(defaults.Functions)),
+	}
+
+	for name, fc := range base.Functions {
+		merged.Functions[name] = fc
+	}
+
+	for name, fc := range defaults.Functions {
+		if _, exists := merged.Functions[name]; !exists {
+			merged.Functions[name] = fc
+		}
+	}
+
+	return merged
+}
+
+// EnsureConfig loads the config from disk and merges in defaults for any
+// registered functions not yet present in the file. If no file exists the
+// defaults are returned. Either way the result is in-memory only — nothing
+// is written to disk automatically.
 func EnsureConfig(funcs []FunctionDefaults) (*AppConfig, error) {
 	path, err := ConfigPath()
 	if err != nil {
 		return nil, err
 	}
 
+	defaults := DefaultAppConfig(funcs)
+
 	if _, err := os.Stat(path); err == nil {
-		return LoadAppConfig(path)
+		existing, loadErr := LoadAppConfig(path)
+		if loadErr != nil {
+			return nil, loadErr
+		}
+		return MergeDefaults(existing, defaults), nil
 	}
 
-	// No config file — generate default (but don't write it automatically)
-	return DefaultAppConfig(funcs), nil
+	return defaults, nil
 }
 
 // BridgeToViper injects AppConfig values into an existing Viper-based Config
@@ -318,6 +381,14 @@ func BridgeToViper(appCfg *AppConfig, viperCfg *Config) {
 	viperCfg.Set("llm.provider", appCfg.LLM.Provider)
 	viperCfg.Set("llm.ollama.endpoint", appCfg.LLM.Endpoint)
 	viperCfg.Set("llm.ollama.model", appCfg.LLM.Model)
+
+	// Agent settings
+	viperCfg.Set("agent.max_iterations", appCfg.Agent.MaxIterations)
+	viperCfg.Set("agent.temperature", appCfg.Agent.Temperature)
+	viperCfg.Set("agent.max_tokens", appCfg.Agent.MaxTokens)
+	viperCfg.Set("agent.context_tokens", appCfg.Agent.ContextTokens)
+	viperCfg.Set("agent.large_result_threshold", appCfg.Agent.LargeResultThreshold)
+	viperCfg.Set("agent.debug_hooks", appCfg.Agent.DebugHooks)
 
 	// Function-specific params — bridge to keys like "websearch.backend"
 	for name, fc := range appCfg.Functions {

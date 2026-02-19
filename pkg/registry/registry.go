@@ -27,12 +27,13 @@ type FactoryFunc func(cfg function.Config) function.AIFunction
 
 // Registration holds information about a registered function.
 type Registration struct {
-	Name         string
-	Factory      FactoryFunc
-	Description  string
-	Category     string
-	Tags         []string
-	ConfigParams []ConfigParam
+	Name             string
+	Factory          FactoryFunc
+	Description      string
+	Category         string
+	Tags             []string
+	ConfigParams     []ConfigParam
+	RequiresApproval bool // default for the requires_approval config key
 }
 
 // Registry manages registered AI functions.
@@ -115,6 +116,27 @@ func (r *Registry) RegisterWithParams(name string, factory FactoryFunc, params [
 		Name:         name,
 		Factory:      factory,
 		ConfigParams: params,
+	}
+}
+
+// SetRequiresApproval marks a registered function as needing user confirmation
+// before the agent executes it. This default is picked up by DefaultAppConfig
+// when generating config.toml and can be overridden by the user there.
+//
+// Call this from the same init() that calls Register/RegisterWithParams.
+//
+// Example:
+//
+//	func init() {
+//	    registry.Global().Register("write_file", NewWriteFile)
+//	    registry.Global().SetRequiresApproval("write_file", true)
+//	}
+func (r *Registry) SetRequiresApproval(name string, required bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if reg, ok := r.registrations[name]; ok {
+		reg.RequiresApproval = required
 	}
 }
 

@@ -1,10 +1,8 @@
 package main
 
 import (
-	"bufio"
 	"fmt"
 	"os"
-	"strings"
 
 	"github.com/pvjammer/ai-sdk-go/pkg/config"
 	"github.com/spf13/cobra"
@@ -13,42 +11,43 @@ import (
 func createInitCommand() *cobra.Command {
 	return &cobra.Command{
 		Use:   "init",
-		Short: "Generate default config file",
-		Long: `Generate a default configuration file at ~/.config/ai/config.toml.
+		Short: "Create or update config file",
+		Long: `Create or update the configuration file at ~/.config/ai/config.toml.
 
-The config file includes LLM provider settings, agent settings, and
-per-function settings with defaults derived from each function's
-declared parameters.`,
+If no config file exists a fresh one is created with defaults for every
+registered function.
+
+If a config file already exists it is updated non-destructively: new
+function sections are added with their defaults and all existing values
+are left unchanged. Safe to run at any time after adding new functions
+or plugins.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			path, err := config.ConfigPath()
 			if err != nil {
 				return fmt.Errorf("cannot determine config path: %w", err)
 			}
 
-			// Check if file exists
+			defaults := config.DefaultAppConfig(registryFunctionDefaults())
+
+			// If a config already exists, merge — never overwrite user values.
+			var final *config.AppConfig
 			if _, err := os.Stat(path); err == nil {
-				fmt.Printf("Config file already exists: %s\n", path)
-				fmt.Print("Overwrite? [y/N] ")
-
-				reader := bufio.NewReader(os.Stdin)
-				answer, _ := reader.ReadString('\n')
-				answer = strings.TrimSpace(strings.ToLower(answer))
-
-				if answer != "y" && answer != "yes" {
-					fmt.Println("Aborted.")
-					return nil
+				existing, loadErr := config.LoadAppConfig(path)
+				if loadErr != nil {
+					return fmt.Errorf("failed to read existing config: %w", loadErr)
 				}
+				final = config.MergeDefaults(existing, defaults)
+				fmt.Printf("Updating config: %s\n", path)
+			} else {
+				final = defaults
+				fmt.Printf("Creating config: %s\n", path)
 			}
 
-			// Generate default config from registry
-			appCfg := config.DefaultAppConfig(registryFunctionDefaults())
-
-			// Write to disk
-			if err := config.SaveAppConfig(path, appCfg); err != nil {
+			if err := config.SaveAppConfig(path, final); err != nil {
 				return fmt.Errorf("failed to write config: %w", err)
 			}
 
-			fmt.Printf("Config written to: %s\n", path)
+			fmt.Println("Done.")
 			return nil
 		},
 	}

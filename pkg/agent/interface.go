@@ -37,6 +37,17 @@ type AIAgent interface {
 	// If the callback returns false, the tool call is skipped.
 	// If nil, all tools execute without approval.
 	SetApprovalFunc(fn func(toolName string, input interface{}) (bool, error))
+
+	// SetHooks installs lifecycle hooks into the agent loop.
+	// Hooks fire at specific points during execution and can transform messages,
+	// tool calls, and results. See AgentHooks for the full set of hook points
+	// and their execution order.
+	SetHooks(hooks AgentHooks)
+
+	// GetHooks returns the currently installed AgentHooks.
+	// Useful for composing additional hooks on top of the defaults installed
+	// by the agent implementation (e.g. layering Logging in verbose mode).
+	GetHooks() AgentHooks
 }
 
 // AgentMetadata contains descriptive information about an agent type.

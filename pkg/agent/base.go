@@ -36,6 +36,9 @@ type AgentBase struct {
 	// approvalFunc is called before each tool execution (optional).
 	approvalFunc func(toolName string, input interface{}) (bool, error)
 
+	// hooks contains optional lifecycle callbacks for the agent loop.
+	hooks AgentHooks
+
 	// Session cleanup
 	cleanupTicker *time.Ticker
 	cleanupDone   chan struct{}
@@ -63,6 +66,17 @@ func (b *AgentBase) SetProvider(provider llm.ToolCallingProvider) {
 // SetApprovalFunc installs a callback invoked before each tool execution.
 func (b *AgentBase) SetApprovalFunc(fn func(toolName string, input interface{}) (bool, error)) {
 	b.approvalFunc = fn
+}
+
+// SetHooks installs lifecycle hooks into the agent loop.
+// Hooks fire at six points during execution; see AgentHooks for details.
+func (b *AgentBase) SetHooks(hooks AgentHooks) {
+	b.hooks = hooks
+}
+
+// GetHooks returns the currently installed AgentHooks.
+func (b *AgentBase) GetHooks() AgentHooks {
+	return b.hooks
 }
 
 // RegisterTool adds an AIFunction as a tool available to the agent.
@@ -214,7 +228,7 @@ func (b *AgentBase) BaseRun(
 		session.lastAccessed = time.Now()
 
 		// Run the agent loop
-		b.executeAgentLoop(ctx, session, message, systemPrompt, maxIterations, thinkingVisible, events)
+		b.executeAgentLoop(ctx, sessionID, session, message, systemPrompt, maxIterations, thinkingVisible, events)
 	}()
 
 	return events
@@ -222,16 +236,20 @@ func (b *AgentBase) BaseRun(
 
 // executeAgentLoop is the core agent loop using native Ollama tool calling.
 //
-// Loop:
-//  1. Append user message to session history
-//  2. For up to maxIterations:
-//     a. Build messages = [system] + session history
-//     b. Call LLM with tool schemas via ChatWithTools
-//     c. If response has ToolCalls: execute each tool, append results to history, continue
-//     d. If response has Text (no ToolCalls): append to history, emit EventResponse + EventComplete, return
-//  3. If max iterations reached: emit EventError
+// Hook call sites (in order):
+//  1. PreInput   — transforms user message before history append
+//  2. PreModel   — transforms message slice before each LLM call
+//  3. PostModel  — transforms LLM response before tool dispatch
+//  4. [EventToolCall emitted]
+//  5. PreTool    — can modify args or deny execution
+//  6. [approvalFunc — existing backward-compat mechanism]
+//  7. executeTool
+//  8. [EventToolResult emitted with raw output]
+//  9. PostTool   — transforms result string before history append
+// 10. PostResponse — called with final text response (non-fatal errors)
 func (b *AgentBase) executeAgentLoop(
 	ctx context.Context,
+	sessionID string,
 	session *agentSession,
 	message string,
 	systemPrompt string,
@@ -239,6 +257,20 @@ func (b *AgentBase) executeAgentLoop(
 	thinkingVisible bool,
 	events chan<- Event,
 ) {
+	// ── Hook: PreInput ──────────────────────────────────────────────────────
+	if b.hooks.PreInput != nil {
+		var err error
+		message, err = b.hooks.PreInput(ctx, sessionID, message)
+		if err != nil {
+			events <- Event{
+				Type:      EventError,
+				Data:      ErrorEvent{Error: err, Message: "PreInput hook failed"},
+				Timestamp: time.Now(),
+			}
+			return
+		}
+	}
+
 	// Append user message to persistent history
 	session.history = append(session.history, llm.ChatMessage{
 		Role:    "user",
@@ -269,6 +301,20 @@ func (b *AgentBase) executeAgentLoop(
 		}
 		messages = append(messages, session.history...)
 
+		// ── Hook: PreModel ─────────────────────────────────────────────────
+		if b.hooks.PreModel != nil {
+			var err error
+			messages, err = b.hooks.PreModel(ctx, messages)
+			if err != nil {
+				events <- Event{
+					Type:      EventError,
+					Data:      ErrorEvent{Error: err, Message: "PreModel hook failed"},
+					Timestamp: time.Now(),
+				}
+				return
+			}
+		}
+
 		// Call LLM with native tool calling
 		chunkCh := b.provider.ChatWithTools(ctx, messages, toolDefs, opts)
 
@@ -285,6 +331,20 @@ func (b *AgentBase) executeAgentLoop(
 			}
 			if chunk.Done {
 				finalChunk = chunk
+			}
+		}
+
+		// ── Hook: PostModel ────────────────────────────────────────────────
+		if b.hooks.PostModel != nil {
+			var err error
+			finalChunk, err = b.hooks.PostModel(ctx, finalChunk)
+			if err != nil {
+				events <- Event{
+					Type:      EventError,
+					Data:      ErrorEvent{Error: err, Message: "PostModel hook failed"},
+					Timestamp: time.Now(),
+				}
+				return
 			}
 		}
 
@@ -308,19 +368,65 @@ func (b *AgentBase) executeAgentLoop(
 
 			// Execute each tool call
 			for _, tc := range finalChunk.ToolCalls {
+				// ── EventToolCall (announce what the model requested) ──────
 				events <- Event{
 					Type:      EventToolCall,
 					Data:      ToolCallEvent{ToolName: tc.Name, Input: tc.Args},
 					Timestamp: time.Now(),
 				}
 
-				// Check approval if configured
+				// ── Hook: PreTool ──────────────────────────────────────────
+				// Runs after EventToolCall so the observer already knows what
+				// the model asked for. Can modify args or silently deny.
+				if b.hooks.PreTool != nil {
+					modifiedCall, proceed, err := b.hooks.PreTool(ctx, tc)
+					if err != nil {
+						events <- Event{
+							Type: EventToolResult,
+							Data: ToolResultEvent{
+								ToolName: tc.Name,
+								Error:    fmt.Errorf("PreTool hook error: %w", err),
+							},
+							Timestamp: time.Now(),
+						}
+						session.history = append(session.history, llm.ChatMessage{
+							Role:       "tool",
+							Content:    fmt.Sprintf("error: PreTool hook failed for %s: %v", tc.Name, err),
+							ToolCallID: tc.ID,
+							ToolName:   tc.Name,
+						})
+						continue
+					}
+					if !proceed {
+						events <- Event{
+							Type: EventToolResult,
+							Data: ToolResultEvent{
+								ToolName: tc.Name,
+								Error:    fmt.Errorf("tool execution denied by PreTool hook"),
+							},
+							Timestamp: time.Now(),
+						}
+						session.history = append(session.history, llm.ChatMessage{
+							Role:       "tool",
+							Content:    fmt.Sprintf("denied: %s was blocked by a hook", tc.Name),
+							ToolCallID: tc.ID,
+							ToolName:   tc.Name,
+						})
+						continue
+					}
+					tc = modifiedCall // use the (possibly modified) call going forward
+				}
+
+				// ── approvalFunc (backward-compat; runs after PreTool) ─────
 				if b.approvalFunc != nil {
 					approved, approvalErr := b.approvalFunc(tc.Name, tc.Args)
 					if approvalErr != nil {
 						events <- Event{
-							Type:      EventToolResult,
-							Data:      ToolResultEvent{ToolName: tc.Name, Error: fmt.Errorf("approval error: %w", approvalErr)},
+							Type: EventToolResult,
+							Data: ToolResultEvent{
+								ToolName: tc.Name,
+								Error:    fmt.Errorf("approval error: %w", approvalErr),
+							},
 							Timestamp: time.Now(),
 						}
 						session.history = append(session.history, llm.ChatMessage{
@@ -333,8 +439,11 @@ func (b *AgentBase) executeAgentLoop(
 					}
 					if !approved {
 						events <- Event{
-							Type:      EventToolResult,
-							Data:      ToolResultEvent{ToolName: tc.Name, Error: fmt.Errorf("tool execution denied by user")},
+							Type: EventToolResult,
+							Data: ToolResultEvent{
+								ToolName: tc.Name,
+								Error:    fmt.Errorf("tool execution denied by user"),
+							},
 							Timestamp: time.Now(),
 						}
 						session.history = append(session.history, llm.ChatMessage{
@@ -348,24 +457,38 @@ func (b *AgentBase) executeAgentLoop(
 				}
 
 				// Execute the tool
-				output, err := b.executeTool(ctx, tc)
+				output, execErr := b.executeTool(ctx, tc)
 
+				// ── EventToolResult (raw output — UI sees the real result) ─
 				events <- Event{
 					Type:      EventToolResult,
-					Data:      ToolResultEvent{ToolName: tc.Name, Output: output, Error: err},
+					Data:      ToolResultEvent{ToolName: tc.Name, Output: output, Error: execErr},
 					Timestamp: time.Now(),
 				}
 
-				// Format result content for history
+				// Marshal result to string for history
 				var resultContent string
-				if err != nil {
-					resultContent = fmt.Sprintf("error: %v", err)
+				if execErr != nil {
+					resultContent = fmt.Sprintf("error: %v", execErr)
 				} else {
 					resultBytes, marshalErr := json.Marshal(output)
 					if marshalErr != nil {
 						resultContent = fmt.Sprintf("%v", output)
 					} else {
 						resultContent = string(resultBytes)
+					}
+				}
+
+				// ── Hook: PostTool ─────────────────────────────────────────
+				// Transforms result string before it enters history.
+				// The model sees the hook's output; the UI already saw the raw
+				// output via EventToolResult above.
+				if b.hooks.PostTool != nil {
+					modified, hookErr := b.hooks.PostTool(ctx, tc.Name, resultContent, execErr)
+					if hookErr != nil {
+						resultContent = fmt.Sprintf("error: PostTool hook failed: %v", hookErr)
+					} else {
+						resultContent = modified
 					}
 				}
 
@@ -388,6 +511,18 @@ func (b *AgentBase) executeAgentLoop(
 				Role:    "assistant",
 				Content: finalChunk.Text,
 			})
+
+			// ── Hook: PostResponse (non-fatal) ─────────────────────────────
+			if b.hooks.PostResponse != nil {
+				if err := b.hooks.PostResponse(ctx, finalChunk.Text); err != nil {
+					events <- Event{
+						Type:      EventError,
+						Data:      ErrorEvent{Error: err, Message: "PostResponse hook failed"},
+						Timestamp: time.Now(),
+					}
+					// Non-fatal: fall through to emit EventResponse + EventComplete
+				}
+			}
 
 			events <- Event{
 				Type:      EventResponse,

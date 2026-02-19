@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/pvjammer/ai-sdk-go/pkg/agent"
+	agenthooks "github.com/pvjammer/ai-sdk-go/pkg/agent/hooks"
 	"github.com/pvjammer/ai-sdk-go/pkg/agentreg"
 	"github.com/pvjammer/ai-sdk-go/pkg/config"
 	"github.com/pvjammer/ai-sdk-go/pkg/registry"
@@ -66,6 +67,16 @@ func runChatCommand(args []string, verbose bool) error {
 	// Wire approval callback for tools that require it
 	if appCfg != nil {
 		installApprovalFunc(a, appCfg)
+	}
+
+	// In verbose mode, layer the Logging hook on top of whatever hooks the
+	// agent already installed. Logging observes all six hook points without
+	// modifying any values, so it is safe to prepend to any existing hooks.
+	if verbose {
+		a.SetHooks(agenthooks.Combine(
+			agenthooks.Logging(os.Stderr),
+			a.GetHooks(),
+		))
 	}
 
 	// Single-shot mode: one message, then exit
