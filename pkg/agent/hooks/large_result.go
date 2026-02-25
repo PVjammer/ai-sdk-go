@@ -14,16 +14,22 @@ import (
 //
 // The history entry that the model sees is replaced with a short reference:
 //
-//	[Tool result is large (N bytes) and has been saved to: /tmp/ai-tool-read_file-12345.json
+//	[Tool result is large (N bytes) and has been saved to: /tmp/ai-tool-name-12345.json
 //	 Use the read_file tool to access it, optionally with start_line and line_count for chunked access.]
 //
 // The caller's UI still receives the full raw output via EventToolResult (which
 // is emitted before PostTool runs), so nothing is hidden from the user.
 //
+// excludeTools lists tool names that should never be redirected to a file.
+// Excluded tools that exceed the threshold are instead truncated with a note
+// about using chunking parameters. This prevents redirect loops: read_file is
+// the tool used to read redirected results, so it must never itself redirect.
+//
 // Parameters:
 //   - threshold: byte length above which results are offloaded. 0 → default (8192).
 //   - dir: directory for temp files. "" → os.TempDir().
-func LargeResult(threshold int, dir string) agent.AgentHooks {
+//   - excludeTools: tool names exempt from file redirection (e.g. "read_file").
+func LargeResult(threshold int, dir string, excludeTools ...string) agent.AgentHooks {
 	if threshold <= 0 {
 		threshold = 8192
 	}
@@ -31,10 +37,25 @@ func LargeResult(threshold int, dir string) agent.AgentHooks {
 		dir = os.TempDir()
 	}
 
+	excluded := make(map[string]bool, len(excludeTools))
+	for _, t := range excludeTools {
+		excluded[t] = true
+	}
+
 	return agent.AgentHooks{
 		PostTool: func(ctx context.Context, toolName, result string, execErr error) (string, error) {
 			// Never redirect error strings or small results.
 			if execErr != nil || len(result) <= threshold {
+				return result, nil
+			}
+
+			// Excluded tools pass through unchanged, even when large.
+			// This prevents redirect loops: read_file is the tool the model uses
+			// to access redirected results, so redirecting its output would create
+			// an infinite cycle. list_files is excluded for the same reason.
+			// These tools have their own built-in size limits (max_bytes, max_entries)
+			// that bound their output; TokenLimit handles any context pressure.
+			if excluded[toolName] {
 				return result, nil
 			}
 

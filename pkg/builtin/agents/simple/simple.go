@@ -90,7 +90,11 @@ func buildHooks(cfg function.Config) agent.AgentHooks {
 	if largeResultThreshold <= 0 {
 		largeResultThreshold = 8192
 	}
-	hs = append(hs, agenthooks.LargeResult(largeResultThreshold, ""))
+	// read_file and list_files are excluded from LargeResult entirely (no redirect,
+	// no truncation). They are the tools the model uses to access redirected results,
+	// so redirecting their output creates an infinite loop. Both tools have built-in
+	// size limits (max_bytes, max_entries); TokenLimit manages any context pressure.
+	hs = append(hs, agenthooks.LargeResult(largeResultThreshold, "", "read_file", "list_files"))
 
 	// ── Optional debug logging ────────────────────────────────────────────
 	// Logs all six hook points to stderr. Useful during development.
