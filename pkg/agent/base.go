@@ -9,6 +9,7 @@ import (
 
 	"github.com/pvjammer/ai-sdk-go/pkg/function"
 	"github.com/pvjammer/ai-sdk-go/pkg/llm"
+	"github.com/pvjammer/ai-sdk-go/pkg/skill"
 )
 
 // AgentBase provides shared implementation for all AI agent types.
@@ -38,6 +39,10 @@ type AgentBase struct {
 
 	// hooks contains optional lifecycle callbacks for the agent loop.
 	hooks AgentHooks
+
+	// skillLoader, when non-nil, appends the skill catalog XML to the system
+	// prompt so the model knows which skills are available.
+	skillLoader *skill.SkillLoader
 
 	// Session cleanup
 	cleanupTicker *time.Ticker
@@ -77,6 +82,12 @@ func (b *AgentBase) SetHooks(hooks AgentHooks) {
 // GetHooks returns the currently installed AgentHooks.
 func (b *AgentBase) GetHooks() AgentHooks {
 	return b.hooks
+}
+
+// SetSkillLoader attaches a SkillLoader whose catalog XML is appended to the
+// system prompt on every Run() call, making skills discoverable by the model.
+func (b *AgentBase) SetSkillLoader(loader *skill.SkillLoader) {
+	b.skillLoader = loader
 }
 
 // RegisterTool adds an AIFunction as a tool available to the agent.
@@ -206,6 +217,14 @@ func (b *AgentBase) BaseRun(
 	maxIterations int,
 	thinkingVisible bool,
 ) <-chan Event {
+	// Append skill catalog XML to system prompt when a loader is attached.
+	// This follows the Claude Code pattern: only name+description in context by default.
+	if b.skillLoader != nil {
+		if catalog := b.skillLoader.CatalogXML(); catalog != "" {
+			systemPrompt = systemPrompt + "\n\n" + catalog
+		}
+	}
+
 	events := make(chan Event, 50)
 
 	go func() {
@@ -257,6 +276,9 @@ func (b *AgentBase) executeAgentLoop(
 	thinkingVisible bool,
 	events chan<- Event,
 ) {
+	// Inject session ID into context so tools (e.g. activate_skill) can read it.
+	ctx = skill.WithSessionID(ctx, sessionID)
+
 	// ── Hook: PreInput ──────────────────────────────────────────────────────
 	if b.hooks.PreInput != nil {
 		var err error

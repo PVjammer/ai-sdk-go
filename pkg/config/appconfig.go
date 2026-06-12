@@ -15,6 +15,32 @@ type AppConfig struct {
 	LLM       LLMConfig                 `toml:"llm"`
 	Agent     AppAgentConfig            `toml:"agent"`
 	Functions map[string]FunctionConfig `toml:"functions"`
+	Workflows map[string]WorkflowConfig `toml:"workflows"`
+	Skills    SkillsConfig              `toml:"skills"`
+}
+
+// SkillsConfig holds global skill discovery settings.
+type SkillsConfig struct {
+	// ScanPaths lists additional directories to scan beyond the 5 standard paths.
+	ScanPaths []string `toml:"scan_paths"`
+	// TrustProject allows shell injection from project-scope skills (default: true).
+	TrustProject bool `toml:"trust_project"`
+	// TrustUser allows shell injection from user-scope skills (default: true).
+	TrustUser bool `toml:"trust_user"`
+}
+
+// WorkflowConfig holds per-workflow settings.
+//
+// The common fields (Enabled, RequiresApproval, LLM overrides) are always present.
+// Workflow-specific parameters are stored in the Params map and serialized flat
+// alongside the common fields in TOML.
+type WorkflowConfig struct {
+	Enabled          bool           `toml:"enabled"`
+	RequiresApproval bool           `toml:"requires_approval"`
+	LLMProvider      string         `toml:"llm_provider,omitempty"`
+	LLMEndpoint      string         `toml:"llm_endpoint,omitempty"`
+	LLMModel         string         `toml:"llm_model,omitempty"`
+	Params           map[string]any `toml:"-"`
 }
 
 // LLMConfig holds LLM provider settings.
@@ -77,6 +103,15 @@ var commonFields = map[string]bool{
 	"requires_approval": true,
 }
 
+// workflowCommonFields are the reserved keys in a workflow config section.
+var workflowCommonFields = map[string]bool{
+	"enabled":           true,
+	"requires_approval": true,
+	"llm_provider":      true,
+	"llm_endpoint":      true,
+	"llm_model":         true,
+}
+
 // ConfigDir returns the XDG config directory for the ai CLI, creating it if needed.
 func ConfigDir() (string, error) {
 	dir := os.Getenv("XDG_CONFIG_HOME")
@@ -119,6 +154,11 @@ func LoadAppConfig(path string) (*AppConfig, error) {
 
 	cfg := &AppConfig{
 		Functions: make(map[string]FunctionConfig),
+		Workflows: make(map[string]WorkflowConfig),
+		Skills: SkillsConfig{
+			TrustProject: true,
+			TrustUser:    true,
+		},
 	}
 
 	// Parse LLM section
@@ -191,6 +231,63 @@ func LoadAppConfig(path string) (*AppConfig, error) {
 		}
 	}
 
+	// Parse Workflows sections
+	if wfsRaw, ok := raw["workflows"].(map[string]any); ok {
+		for name, v := range wfsRaw {
+			wfMap, ok := v.(map[string]any)
+			if !ok {
+				continue
+			}
+
+			wc := WorkflowConfig{
+				Enabled: true,
+				Params:  make(map[string]any),
+			}
+
+			if v, ok := wfMap["enabled"].(bool); ok {
+				wc.Enabled = v
+			}
+			if v, ok := wfMap["requires_approval"].(bool); ok {
+				wc.RequiresApproval = v
+			}
+			if v, ok := wfMap["llm_provider"].(string); ok {
+				wc.LLMProvider = v
+			}
+			if v, ok := wfMap["llm_endpoint"].(string); ok {
+				wc.LLMEndpoint = v
+			}
+			if v, ok := wfMap["llm_model"].(string); ok {
+				wc.LLMModel = v
+			}
+
+			// Everything else goes into Params
+			for k, val := range wfMap {
+				if !workflowCommonFields[k] {
+					wc.Params[k] = val
+				}
+			}
+
+			cfg.Workflows[name] = wc
+		}
+	}
+
+	// Parse Skills section
+	if skillsRaw, ok := raw["skills"].(map[string]any); ok {
+		if v, ok := skillsRaw["trust_project"].(bool); ok {
+			cfg.Skills.TrustProject = v
+		}
+		if v, ok := skillsRaw["trust_user"].(bool); ok {
+			cfg.Skills.TrustUser = v
+		}
+		if paths, ok := skillsRaw["scan_paths"].([]any); ok {
+			for _, p := range paths {
+				if s, ok := p.(string); ok && s != "" {
+					cfg.Skills.ScanPaths = append(cfg.Skills.ScanPaths, s)
+				}
+			}
+		}
+	}
+
 	return cfg, nil
 }
 
@@ -238,6 +335,27 @@ func MarshalAppConfig(cfg *AppConfig) string {
 	b.WriteString(fmt.Sprintf("debug_hooks = %t\n", cfg.Agent.DebugHooks))
 	b.WriteString("\n")
 
+	// Skills section
+	b.WriteString("# Skill discovery settings\n")
+	b.WriteString("[skills]\n")
+	b.WriteString("# trust_project: allow shell injection from .claude/skills/ and .agents/skills/\n")
+	b.WriteString(fmt.Sprintf("trust_project = %t\n", cfg.Skills.TrustProject))
+	b.WriteString("# trust_user: allow shell injection from ~/.config/ai/skills/ and ~/.agents/skills/\n")
+	b.WriteString(fmt.Sprintf("trust_user = %t\n", cfg.Skills.TrustUser))
+	if len(cfg.Skills.ScanPaths) > 0 {
+		b.WriteString("scan_paths = [")
+		for i, p := range cfg.Skills.ScanPaths {
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			b.WriteString(fmt.Sprintf("%q", p))
+		}
+		b.WriteString("]\n")
+	} else {
+		b.WriteString("# scan_paths = []  # additional directories to scan\n")
+	}
+	b.WriteString("\n")
+
 	// Functions — sorted by name for deterministic output
 	names := make([]string, 0, len(cfg.Functions))
 	for name := range cfg.Functions {
@@ -263,6 +381,45 @@ func MarshalAppConfig(cfg *AppConfig) string {
 
 		for _, k := range paramKeys {
 			v := fc.Params[k]
+			b.WriteString(formatTOMLValue(k, v))
+		}
+
+		b.WriteString("\n")
+	}
+
+	// Workflows — sorted by name for deterministic output
+	wfNames := make([]string, 0, len(cfg.Workflows))
+	for name := range cfg.Workflows {
+		wfNames = append(wfNames, name)
+	}
+	sort.Strings(wfNames)
+
+	for _, name := range wfNames {
+		wc := cfg.Workflows[name]
+
+		b.WriteString(fmt.Sprintf("# Workflow: %s\n", name))
+		b.WriteString(fmt.Sprintf("[workflows.%s]\n", name))
+		b.WriteString(fmt.Sprintf("enabled = %t\n", wc.Enabled))
+		b.WriteString(fmt.Sprintf("requires_approval = %t\n", wc.RequiresApproval))
+		if wc.LLMProvider != "" {
+			b.WriteString(fmt.Sprintf("llm_provider = %q\n", wc.LLMProvider))
+		}
+		if wc.LLMEndpoint != "" {
+			b.WriteString(fmt.Sprintf("llm_endpoint = %q\n", wc.LLMEndpoint))
+		}
+		if wc.LLMModel != "" {
+			b.WriteString(fmt.Sprintf("llm_model = %q\n", wc.LLMModel))
+		}
+
+		// Write workflow-specific params sorted by key
+		paramKeys := make([]string, 0, len(wc.Params))
+		for k := range wc.Params {
+			paramKeys = append(paramKeys, k)
+		}
+		sort.Strings(paramKeys)
+
+		for _, k := range paramKeys {
+			v := wc.Params[k]
 			b.WriteString(formatTOMLValue(k, v))
 		}
 
@@ -308,6 +465,11 @@ func DefaultAppConfig(funcs []FunctionDefaults) *AppConfig {
 			DebugHooks:           false,
 		},
 		Functions: make(map[string]FunctionConfig),
+		Workflows: make(map[string]WorkflowConfig),
+		Skills: SkillsConfig{
+			TrustProject: true,
+			TrustUser:    true,
+		},
 	}
 
 	for _, fd := range funcs {
@@ -335,7 +497,9 @@ func MergeDefaults(base, defaults *AppConfig) *AppConfig {
 	merged := &AppConfig{
 		LLM:       base.LLM,
 		Agent:     base.Agent,
+		Skills:    base.Skills,
 		Functions: make(map[string]FunctionConfig, len(base.Functions)+len(defaults.Functions)),
+		Workflows: make(map[string]WorkflowConfig, len(base.Workflows)+len(defaults.Workflows)),
 	}
 
 	for name, fc := range base.Functions {
@@ -345,6 +509,16 @@ func MergeDefaults(base, defaults *AppConfig) *AppConfig {
 	for name, fc := range defaults.Functions {
 		if _, exists := merged.Functions[name]; !exists {
 			merged.Functions[name] = fc
+		}
+	}
+
+	for name, wc := range base.Workflows {
+		merged.Workflows[name] = wc
+	}
+
+	for name, wc := range defaults.Workflows {
+		if _, exists := merged.Workflows[name]; !exists {
+			merged.Workflows[name] = wc
 		}
 	}
 
@@ -394,6 +568,24 @@ func BridgeToViper(appCfg *AppConfig, viperCfg *Config) {
 	for name, fc := range appCfg.Functions {
 		for k, v := range fc.Params {
 			viperCfg.Set(name+"."+k, v)
+		}
+	}
+
+	// Workflow settings — bridge to keys like "workflows.jira-sync.enabled"
+	for name, wc := range appCfg.Workflows {
+		viperCfg.Set("workflows."+name+".enabled", wc.Enabled)
+		viperCfg.Set("workflows."+name+".requires_approval", wc.RequiresApproval)
+		if wc.LLMProvider != "" {
+			viperCfg.Set("workflows."+name+".llm_provider", wc.LLMProvider)
+		}
+		if wc.LLMEndpoint != "" {
+			viperCfg.Set("workflows."+name+".llm_endpoint", wc.LLMEndpoint)
+		}
+		if wc.LLMModel != "" {
+			viperCfg.Set("workflows."+name+".llm_model", wc.LLMModel)
+		}
+		for k, v := range wc.Params {
+			viperCfg.Set("workflows."+name+"."+k, v)
 		}
 	}
 }

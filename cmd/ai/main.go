@@ -10,6 +10,7 @@ import (
 	"github.com/pvjammer/ai-sdk-go/pkg/cli"
 	"github.com/pvjammer/ai-sdk-go/pkg/config"
 	"github.com/pvjammer/ai-sdk-go/pkg/registry"
+	"github.com/pvjammer/ai-sdk-go/pkg/skill"
 	"github.com/spf13/cobra"
 
 	// Import builtin functions to trigger auto-registration
@@ -17,6 +18,7 @@ import (
 	_ "github.com/pvjammer/ai-sdk-go/pkg/builtin/extract"
 	_ "github.com/pvjammer/ai-sdk-go/pkg/builtin/fileio"
 	_ "github.com/pvjammer/ai-sdk-go/pkg/builtin/httprequest"
+	skillsbuiltin "github.com/pvjammer/ai-sdk-go/pkg/builtin/skills"
 	_ "github.com/pvjammer/ai-sdk-go/pkg/builtin/summarize"
 	_ "github.com/pvjammer/ai-sdk-go/pkg/builtin/texttransform"
 	_ "github.com/pvjammer/ai-sdk-go/pkg/builtin/websearch"
@@ -25,9 +27,10 @@ import (
 const version = "0.1.0"
 
 var (
-	configFile  string
-	showVersion bool
-	appCfg      *config.AppConfig
+	configFile      string
+	showVersion     bool
+	appCfg          *config.AppConfig
+	globalSkillLoader *skill.SkillLoader
 )
 
 func main() {
@@ -87,6 +90,13 @@ or called programmatically via the Go API.`,
 	// Auto-discover and add function commands
 	addFunctionCommands(rootCmd)
 
+	// Discover skills, set the loader for builtin tools, register skill commands
+	globalSkillLoader = discoverSkills()
+	skillsbuiltin.SetLoader(globalSkillLoader)
+	if globalSkillLoader != nil {
+		addSkillCommands(rootCmd, globalSkillLoader)
+	}
+
 	// Execute
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
@@ -138,6 +148,108 @@ func loadAppConfig() (*config.AppConfig, error) {
 
 	// Check XDG default path
 	return config.EnsureConfig(registryFunctionDefaults())
+}
+
+// discoverSkills scans the standard skill directories and returns a populated loader.
+// On error, a partial loader is returned (never nil) so the rest of startup continues.
+func discoverSkills() *skill.SkillLoader {
+	loader := skill.NewSkillLoader()
+
+	// Use extra paths from config if already loaded
+	var extraPaths []string
+	cfg := appCfg
+	if cfg == nil {
+		cfg, _ = loadAppConfig()
+	}
+	if cfg != nil {
+		extraPaths = cfg.Skills.ScanPaths
+	}
+
+	if err := loader.Scan(extraPaths); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: skill discovery error: %v\n", err)
+	}
+
+	return loader
+}
+
+// addSkillCommands registers a Cobra command for each user-invocable skill.
+//   - Type B (function-backed) skills: alias to the backing function's CLI command.
+//   - Type A/C (prompt/script) skills: run the agent with the skill body as initial message.
+func addSkillCommands(rootCmd *cobra.Command, loader *skill.SkillLoader) {
+	existingNames := make(map[string]bool)
+	for _, cmd := range rootCmd.Commands() {
+		existingNames[cmd.Name()] = true
+	}
+
+	cfg := config.GlobalConfig()
+
+	for _, record := range loader.Catalog() {
+		record := record // capture
+
+		if !record.IsUserInvocable() {
+			continue
+		}
+
+		// Skip collision with built-in commands
+		if existingNames[record.Frontmatter.Name] {
+			fmt.Fprintf(os.Stderr, "warning: skill %q conflicts with an existing command; skipping CLI registration\n", record.Frontmatter.Name)
+			continue
+		}
+		existingNames[record.Frontmatter.Name] = true
+
+		var cmd *cobra.Command
+
+		if record.Type == skill.SkillTypeFunction && record.Frontmatter.Function != "" {
+			// Type B: thin alias for the backing AIFunction's command
+			fn := registry.Global().Get(record.Frontmatter.Function, cfg)
+			if fn == nil {
+				fmt.Fprintf(os.Stderr, "warning: skill %q: function %q not found in registry\n",
+					record.Frontmatter.Name, record.Frontmatter.Function)
+				continue
+			}
+			cmd = cli.AsCommand(fn)
+			cmd.Use = record.Frontmatter.Name
+			if len(cmd.Use) > 0 && strings.Contains(cmd.Use, " ") {
+				// Keep flags from original Use but replace the command name
+				cmd.Use = record.Frontmatter.Name + cmd.Use[strings.Index(cmd.Use, " "):]
+			}
+			cmd.Short = record.Frontmatter.Description
+		} else {
+			// Type A/C: agent-invoked command
+			cmd = createSkillAgentCommand(record)
+		}
+
+		rootCmd.AddCommand(cmd)
+	}
+}
+
+// createSkillAgentCommand creates a Cobra command that activates a prompt/script skill
+// by injecting its body as the initial agent message.
+func createSkillAgentCommand(record skill.SkillRecord) *cobra.Command {
+	hint := ""
+	if record.Frontmatter.ArgumentHint != "" {
+		hint = " " + record.Frontmatter.ArgumentHint
+	}
+
+	return &cobra.Command{
+		Use:   record.Frontmatter.Name + hint,
+		Short: record.Frontmatter.Description,
+		Long:  record.Frontmatter.Description,
+		Args:  cobra.ArbitraryArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			body, err := skill.ReadBody(record.SkillMDPath)
+			if err != nil {
+				return fmt.Errorf("loading skill %q: %w", record.Frontmatter.Name, err)
+			}
+
+			message := skill.Substitute(body, args, record.SkillDir, "cli-"+record.Frontmatter.Name)
+			if len(args) > 0 {
+				message += "\n\nUser request: " + strings.Join(args, " ")
+			}
+
+			return runChatCommand([]string{message}, false)
+		},
+	}
 }
 
 // addFunctionCommands discovers functions from the registry and adds them as commands.

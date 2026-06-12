@@ -1,11 +1,20 @@
-// Package extract provides data extraction functions.
+// Package extract provides data extraction from text using either LLM-based
+// arbitrary extraction or regex-based extraction for well-known patterns.
 //
-// This package implements regex-based data extraction for common patterns
-// like emails, phone numbers, URLs, dates, times, and names.
+// LLM path (--type flag): handles any natural-language type description.
+//
+//	cat schema.sql   | extract --type "table names"
+//	cat access.log   | extract --type "IP addresses" --format json
+//	cat main.go      | extract --type "function signatures"
+//
+// Regex path (--data-types flag): fast, deterministic, no LLM required.
+//
+//	cat contacts.txt | extract --data-types emails,phones
 package extract
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"reflect"
 	"regexp"
@@ -14,23 +23,35 @@ import (
 	"github.com/pvjammer/ai-sdk-go/internal/schema"
 	"github.com/pvjammer/ai-sdk-go/internal/validation"
 	"github.com/pvjammer/ai-sdk-go/pkg/function"
+	"github.com/pvjammer/ai-sdk-go/pkg/llm"
 )
 
 // ExtractFunction performs data extraction from text.
 type ExtractFunction struct {
 	function.Base
+	provider llm.Provider
 }
 
 // Input defines the input schema for extraction.
 type Input struct {
-	Text       string   `json:"text" validate:"required,min=1" description:"Text to extract data from"`
-	DataTypes  []string `json:"data_types" description:"Types of data to extract (emails, phones, urls, dates, times, names, all)" default:"all"`
+	Text string `json:"text" validate:"required,min=1" description:"Text to extract data from"`
+
+	// LLM-based extraction — use for any natural-language type description.
+	Type   string `json:"type" description:"What to extract, in natural language: 'table names', 'function signatures', 'error messages', 'IP addresses', etc. When set, uses LLM extraction."`
+	Format string `json:"format" description:"Output format for LLM extraction: list (one per line), json (array), csv" default:"list"`
+
+	// Regex-based extraction — fast, for well-known patterns.
+	DataTypes  []string `json:"data_types" description:"Regex-based extraction types: emails, phones, urls, dates, times, names, all"`
 	Unique     bool     `json:"unique" description:"Return only unique values" default:"true"`
 	CaseIgnore bool     `json:"case_ignore" description:"Case-insensitive matching" default:"true"`
 }
 
 // Output defines the output structure.
+// Result is always populated and is used by the shell's display helper.
 type Output struct {
+	Result string `json:"result,omitempty"`
+
+	// Populated only for regex-based extraction.
 	Emails []string `json:"emails,omitempty"`
 	Phones []string `json:"phones,omitempty"`
 	URLs   []string `json:"urls,omitempty"`
@@ -39,100 +60,158 @@ type Output struct {
 	Names  []string `json:"names,omitempty"`
 }
 
-// Regex patterns for extraction
 var (
 	emailRegex = regexp.MustCompile(`[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}`)
 	phoneRegex = regexp.MustCompile(`(\+\d{1,3}[-.]?)?\(?\d{3}\)?[-.]?\d{3}[-.]?\d{4}`)
-	urlRegex   = regexp.MustCompile(`https?://[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}[/a-zA-Z0-9._~:/?#[@!$&'()*+,;=-]*`)
+	urlRegex   = regexp.MustCompile(`https?://[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}[/a-zA-Z0-9._~:/?#\[@!$&'()*+,;=-]*`)
 	dateRegex  = regexp.MustCompile(`\b(\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4}[/-]\d{1,2}[/-]\d{1,2}|[A-Z][a-z]+\s+\d{1,2},?\s+\d{4})\b`)
 	timeRegex  = regexp.MustCompile(`\b(\d{1,2}:\d{2}(:\d{2})?(\s*[AaPp][Mm])?)\b`)
 	nameRegex  = regexp.MustCompile(`\b([A-Z][a-z]+\s+[A-Z][a-z]+)\b`)
 )
 
-// New creates a new ExtractFunction.
+// New creates a new ExtractFunction with lazy LLM provider resolution.
 func New(cfg function.Config) function.AIFunction {
-	return &ExtractFunction{
-		Base: function.NewBase(cfg),
-	}
+	return &ExtractFunction{Base: function.NewBase(cfg)}
 }
 
-// NewDefault creates a new ExtractFunction with default config.
-func NewDefault() *ExtractFunction {
-	return &ExtractFunction{
-		Base: function.NewBase(function.NilConfig{}),
+func (f *ExtractFunction) resolveProvider() llm.Provider {
+	if f.provider != nil {
+		return f.provider
 	}
+	cfg := f.Config()
+
+	providerType := cfg.GetString("extract.llm_provider")
+	if providerType == "" {
+		providerType = cfg.GetString("llm.provider")
+	}
+
+	switch providerType {
+	case "ollama", "":
+		endpoint := cfg.GetString("extract.llm_endpoint")
+		if endpoint == "" {
+			endpoint = cfg.GetString("llm.ollama.endpoint")
+		}
+		if endpoint == "" {
+			endpoint = "http://localhost:11434"
+		}
+		model := cfg.GetString("extract.llm_model")
+		if model == "" {
+			model = cfg.GetString("llm.ollama.model")
+		}
+		if model == "" {
+			model = "llama3.2:latest"
+		}
+		p, err := llm.NewOllamaProvider(endpoint, model)
+		if err != nil {
+			p, _ = llm.NewOllamaProvider("http://localhost:11434", "llama3.2:latest")
+		}
+		f.provider = p
+	default:
+		f.provider, _ = llm.NewOllamaProvider("http://localhost:11434", "llama3.2:latest")
+	}
+	return f.provider
 }
 
 // Execute implements the AIFunction interface.
 func (f *ExtractFunction) Execute(ctx context.Context, input interface{}) (interface{}, error) {
-	// Type assert input
 	var in *Input
-
 	switch v := input.(type) {
 	case *Input:
 		in = v
 	case map[string]interface{}:
-		in = &Input{}
-		if text, ok := v["text"].(string); ok {
-			in.Text = text
-		}
-		if dataTypes, ok := v["data_types"].([]interface{}); ok {
-			in.DataTypes = make([]string, len(dataTypes))
-			for i, dt := range dataTypes {
-				if s, ok := dt.(string); ok {
-					in.DataTypes[i] = s
-				}
-			}
-		} else if dataTypes, ok := v["data_types"].([]string); ok {
-			in.DataTypes = dataTypes
-		}
-		if unique, ok := v["unique"].(bool); ok {
-			in.Unique = unique
-		}
-		if caseIgnore, ok := v["case_ignore"].(bool); ok {
-			in.CaseIgnore = caseIgnore
-		}
-		// Set defaults
-		if len(in.DataTypes) == 0 {
-			in.DataTypes = []string{"all"}
-		}
-		if _, ok := v["unique"]; !ok {
-			in.Unique = true
-		}
-		if _, ok := v["case_ignore"]; !ok {
-			in.CaseIgnore = true
-		}
+		in = f.parseMapInput(v)
 	default:
 		return nil, function.NewExecutionError(f, "input validation", "invalid input type")
 	}
 
-	// Validate
 	if err := validation.Validate(in); err != nil {
 		return nil, function.WrapValidationError(f, err)
 	}
-
-	// Check context
-	select {
-	case <-ctx.Done():
+	if ctx.Err() != nil {
 		return nil, ctx.Err()
-	default:
 	}
 
-	// Perform extraction
-	output, err := f.extract(in)
-	if err != nil {
-		return nil, function.WrapExecutionError(f, "extraction", err)
+	if strings.TrimSpace(in.Type) != "" {
+		return f.extractWithLLM(ctx, in)
 	}
-
-	return output, nil
+	return f.extractWithRegex(in)
 }
 
-// extract performs the actual data extraction.
-func (f *ExtractFunction) extract(in *Input) (*Output, error) {
-	output := &Output{}
+// extractWithLLM calls the LLM to extract arbitrary types from text.
+func (f *ExtractFunction) extractWithLLM(ctx context.Context, in *Input) (*Output, error) {
+	format := strings.ToLower(strings.TrimSpace(in.Format))
+	if format == "" {
+		format = "list"
+	}
 
-	// Normalize data types
-	extractAll := false
+	var systemPrompt, userPrompt string
+	switch format {
+	case "json":
+		systemPrompt = "You are a precise data extraction assistant. Output only a JSON array of strings. No explanation, no markdown, no code fences — just the raw JSON array."
+		userPrompt = fmt.Sprintf(
+			"Extract all %s from the following text.\nReturn a JSON array of strings. If nothing is found, return [].\n\nText:\n%s",
+			in.Type, in.Text,
+		)
+	case "csv":
+		systemPrompt = "You are a precise data extraction assistant. Output only comma-separated values on a single line. No explanation, no headers."
+		userPrompt = fmt.Sprintf(
+			"Extract all %s from the following text.\nReturn as comma-separated values. If nothing is found, return an empty string.\n\nText:\n%s",
+			in.Type, in.Text,
+		)
+	default: // list
+		systemPrompt = "You are a precise data extraction assistant. Output only the extracted items, one per line. No explanation, no numbering, no labels."
+		userPrompt = fmt.Sprintf(
+			"Extract all %s from the following text.\nReturn each item on its own line. If nothing is found, output nothing.\n\nText:\n%s",
+			in.Type, in.Text,
+		)
+	}
+
+	opts := llm.DefaultOptions().
+		WithMaxTokens(1024).
+		WithTemperature(0.1).
+		WithSystemPrompt(systemPrompt)
+
+	ch := f.resolveProvider().Ainvoke(ctx, userPrompt, opts)
+	resp, err := llm.CollectResponse(ctx, ch)
+	if err != nil {
+		return nil, function.WrapExecutionError(f, "llm_extraction", err)
+	}
+
+	result := strings.TrimSpace(resp.Text)
+	if format == "json" {
+		result = cleanJSONArray(result)
+	}
+	return &Output{Result: result}, nil
+}
+
+// cleanJSONArray strips markdown fences and validates JSON array output.
+func cleanJSONArray(s string) string {
+	s = strings.TrimSpace(s)
+	if idx := strings.Index(s, "```"); idx >= 0 {
+		s = s[idx:]
+		s = strings.TrimPrefix(s, "```json")
+		s = strings.TrimPrefix(s, "```")
+		if end := strings.LastIndex(s, "```"); end >= 0 {
+			s = s[:end]
+		}
+		s = strings.TrimSpace(s)
+	}
+	var check []interface{}
+	if err := json.Unmarshal([]byte(s), &check); err != nil {
+		return s
+	}
+	b, err := json.Marshal(check)
+	if err != nil {
+		return s
+	}
+	return string(b)
+}
+
+// extractWithRegex runs regex-based extraction for well-known patterns.
+func (f *ExtractFunction) extractWithRegex(in *Input) (*Output, error) {
+	out := &Output{}
+
+	extractAll := len(in.DataTypes) == 0
 	for _, dt := range in.DataTypes {
 		if strings.ToLower(dt) == "all" {
 			extractAll = true
@@ -140,71 +219,102 @@ func (f *ExtractFunction) extract(in *Input) (*Output, error) {
 		}
 	}
 
-	text := in.Text
-	if in.CaseIgnore {
-		// For case-insensitive patterns, we'll work with original case
-		// but the patterns themselves handle case
+	if extractAll || containsLower(in.DataTypes, "emails") {
+		out.Emails = extractPattern(in.Text, emailRegex, in.Unique)
+	}
+	if extractAll || containsLower(in.DataTypes, "phones") {
+		out.Phones = extractPattern(in.Text, phoneRegex, in.Unique)
+	}
+	if extractAll || containsLower(in.DataTypes, "urls") {
+		out.URLs = extractPattern(in.Text, urlRegex, in.Unique)
+	}
+	if extractAll || containsLower(in.DataTypes, "dates") {
+		out.Dates = extractPattern(in.Text, dateRegex, in.Unique)
+	}
+	if extractAll || containsLower(in.DataTypes, "times") {
+		out.Times = extractPattern(in.Text, timeRegex, in.Unique)
+	}
+	if extractAll || containsLower(in.DataTypes, "names") {
+		out.Names = extractPattern(in.Text, nameRegex, in.Unique)
 	}
 
-	// Extract each data type
-	if extractAll || contains(in.DataTypes, "emails") {
-		output.Emails = f.extractPattern(text, emailRegex, in.Unique)
-	}
-
-	if extractAll || contains(in.DataTypes, "phones") {
-		output.Phones = f.extractPattern(text, phoneRegex, in.Unique)
-	}
-
-	if extractAll || contains(in.DataTypes, "urls") {
-		output.URLs = f.extractPattern(text, urlRegex, in.Unique)
-	}
-
-	if extractAll || contains(in.DataTypes, "dates") {
-		output.Dates = f.extractPattern(text, dateRegex, in.Unique)
-	}
-
-	if extractAll || contains(in.DataTypes, "times") {
-		output.Times = f.extractPattern(text, timeRegex, in.Unique)
-	}
-
-	if extractAll || contains(in.DataTypes, "names") {
-		output.Names = f.extractPattern(text, nameRegex, in.Unique)
-	}
-
-	return output, nil
+	out.Result = formatRegexOutput(out)
+	return out, nil
 }
 
-// extractPattern extracts matches using a regex pattern.
-func (f *ExtractFunction) extractPattern(text string, pattern *regexp.Regexp, unique bool) []string {
-	matches := pattern.FindAllString(text, -1)
-
+func extractPattern(text string, re *regexp.Regexp, unique bool) []string {
+	matches := re.FindAllString(text, -1)
 	if !unique {
 		return matches
 	}
-
-	// Remove duplicates
-	seen := make(map[string]bool)
-	result := make([]string, 0)
-
-	for _, match := range matches {
-		if !seen[match] {
-			seen[match] = true
-			result = append(result, match)
+	seen := make(map[string]bool, len(matches))
+	result := make([]string, 0, len(matches))
+	for _, m := range matches {
+		if !seen[m] {
+			seen[m] = true
+			result = append(result, m)
 		}
 	}
-
 	return result
 }
 
-// contains checks if a slice contains a string (case-insensitive).
-func contains(slice []string, str string) bool {
-	str = strings.ToLower(str)
-	for _, s := range slice {
-		if strings.ToLower(s) == str {
-			return true
-		}
+func formatRegexOutput(o *Output) string {
+	var parts []string
+	if len(o.Emails) > 0 {
+		parts = append(parts, "Emails:\n  "+strings.Join(o.Emails, "\n  "))
 	}
-	return false
+	if len(o.Phones) > 0 {
+		parts = append(parts, "Phones:\n  "+strings.Join(o.Phones, "\n  "))
+	}
+	if len(o.URLs) > 0 {
+		parts = append(parts, "URLs:\n  "+strings.Join(o.URLs, "\n  "))
+	}
+	if len(o.Dates) > 0 {
+		parts = append(parts, "Dates:\n  "+strings.Join(o.Dates, "\n  "))
+	}
+	if len(o.Times) > 0 {
+		parts = append(parts, "Times:\n  "+strings.Join(o.Times, "\n  "))
+	}
+	if len(o.Names) > 0 {
+		parts = append(parts, "Names:\n  "+strings.Join(o.Names, "\n  "))
+	}
+	if len(parts) == 0 {
+		return "No data extracted"
+	}
+	return strings.Join(parts, "\n")
+}
+
+func (f *ExtractFunction) parseMapInput(m map[string]interface{}) *Input {
+	changed, _ := m["_changed_flags"].(map[string]bool)
+	isSet := func(key string) bool { return changed == nil || changed[key] }
+
+	in := &Input{Format: "list", Unique: true, CaseIgnore: true}
+
+	if text, ok := m["text"].(string); ok && isSet("text") {
+		in.Text = text
+	}
+	if t, ok := m["type"].(string); ok && isSet("type") {
+		in.Type = t
+	}
+	if f, ok := m["format"].(string); ok && isSet("format") {
+		in.Format = f
+	}
+	if unique, ok := m["unique"].(bool); ok && isSet("unique") {
+		in.Unique = unique
+	}
+	if ci, ok := m["case_ignore"].(bool); ok && isSet("case_ignore") {
+		in.CaseIgnore = ci
+	}
+	if dts, ok := m["data_types"].([]interface{}); ok {
+		for _, dt := range dts {
+			if s, ok := dt.(string); ok {
+				in.DataTypes = append(in.DataTypes, s)
+			}
+		}
+	} else if dts, ok := m["data_types"].([]string); ok {
+		in.DataTypes = dts
+	}
+	return in
 }
 
 // InputSchema implements the AIFunction interface.
@@ -216,75 +326,20 @@ func (f *ExtractFunction) InputSchema() *function.Schema {
 func (f *ExtractFunction) Metadata() *function.Metadata {
 	return function.NewMetadata("ExtractFunction").
 		WithName("extract").
-		WithDescription("Extract structured data from text").
+		WithDescription("Extract structured data from text — arbitrary types via LLM (--type) or well-known patterns via regex (--data-types)").
 		WithToolName("extract_data").
-		WithToolDescription("Extracts structured data (emails, phones, URLs, dates, times, names) from unstructured text using regex patterns").
+		WithToolDescription("Extracts data from text. Use type for LLM-based arbitrary extraction (table names, function signatures, error messages, etc.) or data_types for fast regex extraction of emails/phones/URLs/dates/times/names").
 		WithCLIName("extract").
-		WithCLIDescription("Extract emails, phones, URLs, dates, times, and names from text").
+		WithCLIDescription("Extract data from text using AI (--type) or regex (--data-types)").
 		WithCategory("data").
-		WithTags("data", "extraction", "regex", "parsing", "nlp").
-		WithExamples(
-			function.Example{
-				Input: map[string]interface{}{
-					"text":       "Contact John Smith at john@example.com or call 555-123-4567",
-					"data_types": []string{"emails", "phones", "names"},
-				},
-				Output: &Output{
-					Emails: []string{"john@example.com"},
-					Phones: []string{"555-123-4567"},
-					Names:  []string{"John Smith"},
-				},
-				Description: "Extract contact information",
-			},
-			function.Example{
-				Input: map[string]interface{}{
-					"text":       "Visit https://example.com or https://github.com for more info",
-					"data_types": []string{"urls"},
-				},
-				Output: &Output{
-					URLs: []string{"https://example.com", "https://github.com"},
-				},
-				Description: "Extract URLs",
-			},
-			function.Example{
-				Input: map[string]interface{}{
-					"text": "The meeting is on 12/25/2023 at 3:30 PM",
-				},
-				Output: &Output{
-					Dates: []string{"12/25/2023"},
-					Times: []string{"3:30 PM"},
-				},
-				Description: "Extract dates and times (all types)",
-			},
-		)
+		WithTags("data", "extraction", "llm", "regex", "parsing")
 }
 
-// FormatOutput formats the output as a human-readable string.
-func (o *Output) FormatOutput() string {
-	var parts []string
-
-	if len(o.Emails) > 0 {
-		parts = append(parts, fmt.Sprintf("Emails: %s", strings.Join(o.Emails, ", ")))
+func containsLower(slice []string, s string) bool {
+	for _, v := range slice {
+		if strings.ToLower(v) == s {
+			return true
+		}
 	}
-	if len(o.Phones) > 0 {
-		parts = append(parts, fmt.Sprintf("Phones: %s", strings.Join(o.Phones, ", ")))
-	}
-	if len(o.URLs) > 0 {
-		parts = append(parts, fmt.Sprintf("URLs: %s", strings.Join(o.URLs, ", ")))
-	}
-	if len(o.Dates) > 0 {
-		parts = append(parts, fmt.Sprintf("Dates: %s", strings.Join(o.Dates, ", ")))
-	}
-	if len(o.Times) > 0 {
-		parts = append(parts, fmt.Sprintf("Times: %s", strings.Join(o.Times, ", ")))
-	}
-	if len(o.Names) > 0 {
-		parts = append(parts, fmt.Sprintf("Names: %s", strings.Join(o.Names, ", ")))
-	}
-
-	if len(parts) == 0 {
-		return "No data extracted"
-	}
-
-	return strings.Join(parts, "\n")
+	return false
 }

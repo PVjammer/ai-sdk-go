@@ -12,6 +12,7 @@ import (
 	"github.com/pvjammer/ai-sdk-go/pkg/agentreg"
 	"github.com/pvjammer/ai-sdk-go/pkg/config"
 	"github.com/pvjammer/ai-sdk-go/pkg/registry"
+	"github.com/pvjammer/ai-sdk-go/pkg/skill"
 	"github.com/spf13/cobra"
 
 	// Register the simple agent
@@ -67,6 +68,17 @@ func runChatCommand(args []string, verbose bool) error {
 	// Wire approval callback for tools that require it
 	if appCfg != nil {
 		installApprovalFunc(a, appCfg)
+	}
+
+	// Attach skill loader so the agent injects the skill catalog into its system prompt.
+	// Uses the same type-assertion pattern as ClearSession above.
+	if globalSkillLoader != nil {
+		type skillLoaderSetter interface {
+			SetSkillLoader(loader *skill.SkillLoader)
+		}
+		if sls, ok := a.(skillLoaderSetter); ok {
+			sls.SetSkillLoader(globalSkillLoader)
+		}
 	}
 
 	// In verbose mode, layer the Logging hook on top of whatever hooks the
@@ -224,14 +236,19 @@ func handleChatCommand(cmd string, a agent.AIAgent, sessionID string) bool {
 
 	case "/help":
 		fmt.Println("\nAvailable commands:")
-		fmt.Println("  /help   - Show this help message")
-		fmt.Println("  /tools  - List available tools")
-		fmt.Println("  /clear  - Clear conversation history")
-		fmt.Println("  /quit   - Exit the chat")
+		fmt.Println("  /help        - Show this help message")
+		fmt.Println("  /tools       - List available tools")
+		fmt.Println("  /skills      - List available skills")
+		fmt.Println("  /<skill-name> [args] - Activate a skill by name")
+		fmt.Println("  /clear       - Clear conversation history")
+		fmt.Println("  /quit        - Exit the chat")
 		fmt.Println()
 
 	case "/tools":
 		printChatTools()
+
+	case "/skills":
+		printChatSkills()
 
 	case "/clear":
 		// Type-assert to access ClearSession (AgentBase method)
@@ -246,10 +263,73 @@ func handleChatCommand(cmd string, a agent.AIAgent, sessionID string) bool {
 		}
 
 	default:
+		// Check if the command matches a skill name (slash-command activation)
+		skillName := strings.TrimPrefix(parts[0], "/")
+		if globalSkillLoader != nil {
+			if _, exists := globalSkillLoader.Get(skillName); exists {
+				skillArgs := parts[1:]
+				handleSkillSlashCommand(context.Background(), a, sessionID, skillName, skillArgs)
+				return true
+			}
+		}
 		fmt.Printf("Unknown command: %s (type /help for commands)\n", parts[0])
 	}
 
 	return true
+}
+
+// printChatSkills lists the skills discovered by the skill loader.
+func printChatSkills() {
+	if globalSkillLoader == nil || globalSkillLoader.Count() == 0 {
+		fmt.Println("\n(No skills discovered)")
+		fmt.Println("Place a skill directory containing SKILL.md in .claude/skills/ or ~/.config/ai/skills/")
+		fmt.Println()
+		return
+	}
+
+	fmt.Println("\nAvailable skills:")
+	for _, r := range globalSkillLoader.Catalog() {
+		hint := ""
+		if r.Frontmatter.ArgumentHint != "" {
+			hint = " " + r.Frontmatter.ArgumentHint
+		}
+		typeTag := ""
+		if r.Type == skill.SkillTypeFunction {
+			typeTag = " [function]"
+		}
+		fmt.Printf("  /%-20s %s%s\n", r.Frontmatter.Name+hint, r.Frontmatter.Description, typeTag)
+	}
+	fmt.Println()
+}
+
+// handleSkillSlashCommand activates a skill by injecting its body as a user message
+// into the current conversation session. This follows the Claude Code pattern:
+// skill body is delivered as a conversation turn (Option B), not a system prompt edit.
+func handleSkillSlashCommand(ctx context.Context, a agent.AIAgent, sessionID, skillName string, args []string) {
+	record, ok := globalSkillLoader.Get(skillName)
+	if !ok {
+		fmt.Printf("[skill] %q not found\n", skillName)
+		return
+	}
+
+	body, err := skill.ReadBody(record.SkillMDPath)
+	if err != nil {
+		fmt.Printf("[skill error] %v\n", err)
+		return
+	}
+
+	// Apply variable substitution
+	body = skill.Substitute(body, args, record.SkillDir, sessionID)
+
+	if body == "" {
+		fmt.Printf("[skill] %q has no body — nothing to activate\n", skillName)
+		return
+	}
+
+	// Inject the skill body as a user message into the current session.
+	// The model sees it as an instruction just received and follows it.
+	fmt.Printf("[activating skill: %s]\n", skillName)
+	runOnce(ctx, a, sessionID, body, false)
 }
 
 // printChatTools lists the tools registered in the function registry.
