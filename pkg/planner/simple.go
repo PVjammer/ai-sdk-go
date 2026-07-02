@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"regexp"
 	"strings"
 
 	"github.com/pvjammer/ai-sdk-go/pkg/agentcontext"
@@ -49,40 +48,38 @@ func (p *SimplePlanner) Plan(ctx context.Context, messages []agentcontext.Messag
 	return p.parseResponse(response)
 }
 
-// buildToolsText formats tool definitions as text for inclusion in the system prompt.
+// buildToolsText formats tool definitions in Hermes/Qwen3 XML format for inclusion
+// in the system prompt. This is compatible with all models fine-tuned on the Hermes
+// tool-use dataset (Qwen3, Llama-3.1+, Mistral, DeepSeek, etc.).
 func buildToolsText(tools []ToolDefinition) string {
 	if len(tools) == 0 {
 		return ""
 	}
 
-	var sb strings.Builder
-	sb.WriteString("\n\n## Available Tools\n\n")
-	sb.WriteString("You can use the following tools to help accomplish tasks:\n\n")
-
-	for _, tool := range tools {
-		sb.WriteString(fmt.Sprintf("**%s**: %s\n", tool.Name, tool.Description))
-
-		// Format parameters concisely
-		if len(tool.Parameters) > 0 {
-			sb.WriteString("  Parameters:\n")
-			if props, ok := tool.Parameters["properties"].(map[string]interface{}); ok {
-				for param, details := range props {
-					if detailsMap, ok := details.(map[string]interface{}); ok {
-						desc := detailsMap["description"]
-						sb.WriteString(fmt.Sprintf("  - %s: %v\n", param, desc))
-					}
-				}
-			}
-		}
-		sb.WriteString("\n")
+	type toolSchema struct {
+		Name        string                 `json:"name"`
+		Description string                 `json:"description"`
+		Parameters  map[string]interface{} `json:"parameters"`
 	}
 
-	sb.WriteString("## Tool Usage Format\n\n")
-	sb.WriteString("To use a tool, respond with:\n")
-	sb.WriteString("USE_TOOL: tool_name {\"param1\": \"value1\", \"param2\": \"value2\"}\n\n")
-	sb.WriteString("To respond to the user without using a tool, just write your response normally.\n")
+	schemas := make([]toolSchema, len(tools))
+	for i, t := range tools {
+		params := t.Parameters
+		if params == nil {
+			params = map[string]interface{}{
+				"type":       "object",
+				"properties": map[string]interface{}{},
+			}
+		}
+		schemas[i] = toolSchema{Name: t.Name, Description: t.Description, Parameters: params}
+	}
 
-	return sb.String()
+	jsonBytes, _ := json.MarshalIndent(schemas, "", "  ")
+
+	return "\n\n<tools>\n" + string(jsonBytes) + "\n</tools>\n\n" +
+		"When you need to call a tool, respond with:\n" +
+		"<tool_call>\n{\"name\": \"tool_name\", \"arguments\": {\"param\": \"value\"}}\n</tool_call>\n" +
+		"To respond without a tool, write your answer in plain text."
 }
 
 // buildMessages constructs a multi-message conversation with proper role attribution.
@@ -236,111 +233,39 @@ func formatToolOutput(toolName string, output interface{}) string {
 	return fmt.Sprintf("%v", output)
 }
 
-// extractJSON extracts a JSON object from a string starting at the given position.
-// It handles nested braces and strings containing braces correctly.
-func extractJSON(s string, start int) (string, bool) {
-	if start >= len(s) || s[start] != '{' {
-		return "", false
+// parseResponse parses the LLM's response to determine the action.
+// Uses llm.ParseTextToolCalls to support Hermes, old Qwen, USE_TOOL, and bare-JSON formats.
+func (p *SimplePlanner) parseResponse(response string) (*Plan, error) {
+	if os.Getenv("AGENT_DEBUG") == "1" {
+		fmt.Fprintf(os.Stderr, "=== PLANNER DEBUG: PARSE RESPONSE ===\n%s\n=== END ===\n\n", response)
 	}
 
-	depth := 0
-	inString := false
-	escaped := false
+	calls, _ := llm.ParseTextToolCalls(response)
 
-	for i := start; i < len(s); i++ {
-		ch := s[i]
-
-		if escaped {
-			escaped = false
-			continue
-		}
-
-		if ch == '\\' && inString {
-			escaped = true
-			continue
-		}
-
-		if ch == '"' {
-			inString = !inString
-			continue
-		}
-
-		if inString {
-			continue
-		}
-
-		if ch == '{' {
-			depth++
-		} else if ch == '}' {
-			depth--
-			if depth == 0 {
-				return s[start : i+1], true
+	if len(calls) > 0 {
+		agentCalls := make([]agentcontext.ToolCall, len(calls))
+		for i, c := range calls {
+			agentCalls[i] = agentcontext.ToolCall{
+				Name:  c.Name,
+				Input: c.Args,
 			}
 		}
-	}
-
-	return "", false
-}
-
-// parseResponse parses the LLM's response to determine the action.
-//
-// Looks for "USE_TOOL: name {...}" pattern, otherwise treats as text response.
-func (p *SimplePlanner) parseResponse(response string) (*Plan, error) {
-	// Step 1: Find the tool name and the position of the opening brace
-	toolPattern := regexp.MustCompile(`USE_TOOL:\s*(\w+)\s*\{`)
-	matches := toolPattern.FindStringSubmatchIndex(response)
-
-	if os.Getenv("AGENT_DEBUG") == "1" {
-		fmt.Fprintf(os.Stderr, "=== PLANNER DEBUG: PARSE RESPONSE ===\n")
-		fmt.Fprintf(os.Stderr, "Pattern: USE_TOOL:\\s*(\\w+)\\s*\\{\n")
-		fmt.Fprintf(os.Stderr, "Match indices: %v\n", matches)
-		fmt.Fprintf(os.Stderr, "=== END PARSE ===\n\n")
-	}
-
-	if len(matches) >= 4 {
-		// matches[2]:matches[3] is the tool name capture group
-		toolName := response[matches[2]:matches[3]]
-
-		// The opening brace is at the end of the full match minus 1
-		braceStart := matches[1] - 1
-
-		// Step 2: Extract the full JSON object using brace counting
-		jsonInput, ok := extractJSON(response, braceStart)
 
 		if os.Getenv("AGENT_DEBUG") == "1" {
-			fmt.Fprintf(os.Stderr, "=== TOOL CALL DETECTED ===\n")
-			fmt.Fprintf(os.Stderr, "Tool name: %s\n", toolName)
-			fmt.Fprintf(os.Stderr, "JSON input: %s\n", jsonInput)
-			fmt.Fprintf(os.Stderr, "JSON extracted: %v\n", ok)
-			fmt.Fprintf(os.Stderr, "=== END TOOL CALL ===\n\n")
-		}
-
-		if !ok {
-			return nil, fmt.Errorf("failed to extract JSON object from tool call")
-		}
-
-		// Parse JSON input
-		var input map[string]interface{}
-		if err := json.Unmarshal([]byte(jsonInput), &input); err != nil {
-			if os.Getenv("AGENT_DEBUG") == "1" {
-				fmt.Fprintf(os.Stderr, "ERROR: Failed to parse JSON: %v\n", err)
+			fmt.Fprintf(os.Stderr, "=== TOOL CALLS DETECTED: %d ===\n", len(calls))
+			for _, c := range calls {
+				fmt.Fprintf(os.Stderr, "  tool=%s args=%v\n", c.Name, c.Args)
 			}
-			return nil, fmt.Errorf("failed to parse tool input JSON: %w", err)
+			fmt.Fprintf(os.Stderr, "=== END TOOL CALLS ===\n\n")
 		}
 
 		return &Plan{
-			Action: ActionUseTool,
-			ToolCalls: []agentcontext.ToolCall{
-				{
-					Name:  toolName,
-					Input: input,
-				},
-			},
-			Reasoning: "Decided to use tool: " + toolName,
+			Action:    ActionUseTool,
+			ToolCalls: agentCalls,
+			Reasoning: "Decided to use tool: " + calls[0].Name,
 		}, nil
 	}
 
-	// No tool call, just a text response
 	if os.Getenv("AGENT_DEBUG") == "1" {
 		fmt.Fprintf(os.Stderr, "=== NO TOOL CALL - DIRECT RESPONSE ===\n\n")
 	}

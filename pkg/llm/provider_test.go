@@ -15,8 +15,9 @@ func TestDefaultOptions(t *testing.T) {
 	assert.Equal(t, 2048, opts.MaxTokens)
 	assert.Equal(t, 0.7, opts.Temperature)
 	assert.Empty(t, opts.StopWords)
-	assert.Equal(t, 0.0, opts.TopP)
-	assert.Equal(t, 0, opts.TopK)
+	assert.Equal(t, 0.8, opts.TopP)
+	assert.Equal(t, 20, opts.TopK)
+	assert.Equal(t, 0.0, opts.MinP)
 }
 
 func TestCompletionOptions_Builders(t *testing.T) {

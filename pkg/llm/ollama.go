@@ -24,19 +24,39 @@ var _ ToolCallingProvider = (*OllamaProvider)(nil)
 //
 // See: https://ollama.ai
 type OllamaProvider struct {
-	client   *api.Client
-	model    string
-	endpoint string
+	client     *api.Client
+	model      string
+	endpoint   string
+	hermesMode bool // inject tools via system prompt; parse <tool_call> from response
 }
+
+// OllamaOption is a functional option for configuring OllamaProvider.
+type OllamaOption func(*OllamaProvider)
+
+// WithHermesMode enables Hermes-format tool calling (this is the default).
+//
+// Instead of using Ollama's native `tools` API parameter — which has confirmed bugs
+// rendering tool schemas as garbage and silently stripping tool-call history — this
+// injects tool definitions into the system prompt in Hermes/Qwen3 XML format and
+// parses <tool_call> blocks from the model's text response via ParseTextToolCalls.
+//
+// Compatible with Qwen3, Llama-3.1+, Mistral, DeepSeek, and other Hermes-trained models.
+func WithHermesMode() OllamaOption { return func(p *OllamaProvider) { p.hermesMode = true } }
+
+// WithNativeTools disables Hermes mode and uses Ollama's native `tools` API parameter.
+// Use this only if your Ollama version and specific model have reliable native tool calling.
+func WithNativeTools() OllamaOption { return func(p *OllamaProvider) { p.hermesMode = false } }
 
 // NewOllamaProvider creates a new Ollama provider.
 //
 // Parameters:
 //   - endpoint: Ollama API endpoint (e.g., "http://localhost:11434")
 //   - model: Model name (e.g., "llama3.2:latest", "mistral:7b")
+//   - opts: Optional OllamaOption funcs (e.g., WithNativeTools())
 //
+// Hermes mode is enabled by default. Pass WithNativeTools() to disable it.
 // Returns an error if the endpoint is invalid or the client cannot be created.
-func NewOllamaProvider(endpoint, model string) (*OllamaProvider, error) {
+func NewOllamaProvider(endpoint, model string, opts ...OllamaOption) (*OllamaProvider, error) {
 	if endpoint == "" {
 		endpoint = "http://localhost:11434"
 	}
@@ -57,11 +77,16 @@ func NewOllamaProvider(endpoint, model string) (*OllamaProvider, error) {
 	// Create Ollama client
 	client := api.NewClient(parsedURL, httpClient)
 
-	return &OllamaProvider{
-		client:   client,
-		model:    model,
-		endpoint: endpoint,
-	}, nil
+	p := &OllamaProvider{
+		client:     client,
+		model:      model,
+		endpoint:   endpoint,
+		hermesMode: false, // default: use Ollama native tools (fixed in v0.16+ Go engine)
+	}
+	for _, opt := range opts {
+		opt(p)
+	}
+	return p, nil
 }
 
 // Complete generates a text completion using Ollama.
@@ -396,6 +421,11 @@ func (p *OllamaProvider) ChatMessages(ctx context.Context, messages []ChatMessag
 			req.Options["top_k"] = opts.TopK
 		}
 
+		// Add min_p if specified
+		if opts.MinP > 0 {
+			req.Options["min_p"] = opts.MinP
+		}
+
 		// Execute request with streaming
 		var contentBuilder strings.Builder
 		respFunc := func(resp api.ChatResponse) error {
@@ -484,12 +514,79 @@ func (p *OllamaProvider) ChatMessages(ctx context.Context, messages []ChatMessag
 
 // ChatWithTools implements ToolCallingProvider.
 //
-// It sends the conversation history with structured tool definitions to Ollama.
-// When the model requests tool calls, the final StreamChunk has ToolCalls set.
-// When the model produces a text response, the final StreamChunk has Text set.
+// In Hermes mode (the default), tool definitions are injected into the system
+// prompt in Hermes/Qwen3 XML format, the native `tools` API parameter is omitted
+// to bypass Ollama's known rendering and history-stripping bugs, and tool calls
+// are extracted from the model's text response via ParseTextToolCalls.
+//
+// In native mode (WithNativeTools option), the original behaviour is preserved:
+// tool definitions are passed via the `tools` API field and structured ToolCalls
+// are read from the response.
 //
 // This method always uses non-streaming mode to ensure complete tool call data.
 func (p *OllamaProvider) ChatWithTools(ctx context.Context, messages []ChatMessage, tools []ToolDef, opts *CompletionOptions) <-chan StreamChunk {
+	if p.hermesMode {
+		return p.chatWithToolsHermes(ctx, messages, tools, opts)
+	}
+	return p.chatWithToolsNative(ctx, messages, tools, opts)
+}
+
+// chatWithToolsHermes injects tool schemas into the system prompt and parses
+// <tool_call> blocks from the model's text response.
+func (p *OllamaProvider) chatWithToolsHermes(ctx context.Context, messages []ChatMessage, tools []ToolDef, opts *CompletionOptions) <-chan StreamChunk {
+	ch := make(chan StreamChunk, 10)
+
+	go func() {
+		defer close(ch)
+
+		if opts == nil {
+			opts = DefaultOptions()
+		}
+
+		// Inject <tools> JSON into the system message.
+		injected, err := injectHermesTools(messages, tools)
+		if err != nil {
+			ch <- StreamChunk{Error: fmt.Errorf("hermes tool injection: %w", err), Done: true}
+			return
+		}
+
+		// Use ChatMessages — no `tools` param means no Ollama template bugs.
+		// Force non-streaming so we get a complete response to parse.
+		nonStreamOpts := *opts
+		nonStreamOpts.Stream = false
+		innerCh := p.ChatMessages(ctx, injected, &nonStreamOpts)
+
+		// Drain the inner channel.
+		var final StreamChunk
+		for chunk := range innerCh {
+			if chunk.Error != nil {
+				ch <- chunk
+				return
+			}
+			final = chunk
+		}
+
+		// Parse tool calls from the text response.
+		toolCalls, remaining := ParseTextToolCalls(final.Text)
+
+		ch <- StreamChunk{
+			Text:             remaining,
+			ToolCalls:        toolCalls,
+			Done:             true,
+			TokensUsed:       final.TokensUsed,
+			PromptTokens:     final.PromptTokens,
+			CompletionTokens: final.CompletionTokens,
+			Model:            final.Model,
+			FinishReason:     final.FinishReason,
+		}
+	}()
+
+	return ch
+}
+
+// chatWithToolsNative uses Ollama's native `tools` API parameter.
+// Kept for callers that opt in via WithNativeTools().
+func (p *OllamaProvider) chatWithToolsNative(ctx context.Context, messages []ChatMessage, tools []ToolDef, opts *CompletionOptions) <-chan StreamChunk {
 	ch := make(chan StreamChunk, 10)
 
 	go func() {
@@ -565,6 +662,15 @@ func (p *OllamaProvider) ChatWithTools(ctx context.Context, messages []ChatMessa
 		if len(opts.StopWords) > 0 {
 			req.Options["stop"] = opts.StopWords
 		}
+		if opts.TopP > 0 {
+			req.Options["top_p"] = opts.TopP
+		}
+		if opts.TopK > 0 {
+			req.Options["top_k"] = opts.TopK
+		}
+		if opts.MinP > 0 {
+			req.Options["min_p"] = opts.MinP
+		}
 
 		// Accumulate content and tool calls across callbacks
 		// (Ollama may invoke the callback multiple times even in non-streaming mode)
@@ -632,6 +738,38 @@ func (p *OllamaProvider) ChatWithTools(ctx context.Context, messages []ChatMessa
 	}()
 
 	return ch
+}
+
+// injectHermesTools appends Hermes-format <tools> JSON to the system message.
+// If no system message exists, one is prepended.
+func injectHermesTools(messages []ChatMessage, tools []ToolDef) ([]ChatMessage, error) {
+	if len(tools) == 0 {
+		return messages, nil
+	}
+
+	toolsJSON, err := ToolDefsToHermesJSON(tools)
+	if err != nil {
+		return nil, err
+	}
+
+	toolSection := "\n\n<tools>\n" + toolsJSON + "\n</tools>\n\n" +
+		"When you need to call a tool, respond with a <tool_call> block:\n" +
+		"<tool_call>\n{\"name\": \"tool_name\", \"arguments\": {\"param\": \"value\"}}\n</tool_call>\n" +
+		"You may emit multiple <tool_call> blocks in one response. " +
+		"After tool results are provided, give your final answer in plain text."
+
+	result := make([]ChatMessage, len(messages))
+	copy(result, messages)
+
+	for i, msg := range result {
+		if msg.Role == "system" {
+			result[i].Content = msg.Content + toolSection
+			return result, nil
+		}
+	}
+
+	// No system message — prepend one.
+	return append([]ChatMessage{{Role: "system", Content: strings.TrimLeft(toolSection, "\n")}}, result...), nil
 }
 
 // toolDefToOllamaParams converts a ToolDef's Parameters (JSON Schema) to

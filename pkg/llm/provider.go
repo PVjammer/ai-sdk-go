@@ -150,6 +150,11 @@ type CompletionOptions struct {
 	// If 0, not used.
 	TopK int
 
+	// MinP sets the minimum probability threshold for token selection.
+	// Tokens with probability below min_p * top-token-probability are excluded.
+	// If 0, not used.
+	MinP float64
+
 	// Stream controls whether to stream incremental responses (true) or
 	// return a single complete response (false).
 	// Default: false
@@ -200,14 +205,35 @@ var (
 )
 
 // DefaultOptions returns sensible defaults for completion options.
+// TopP and TopK are set to values recommended by Qwen for tool-calling mode
+// (temperature=0.7, top_p=0.8, top_k=20); these values are safe for all models.
 func DefaultOptions() *CompletionOptions {
 	return &CompletionOptions{
 		MaxTokens:   2048,
 		Temperature: 0.7,
 		StopWords:   []string{},
-		TopP:        0.0, // Not used by default
-		TopK:        0,   // Not used by default
+		TopP:        0.8,
+		TopK:        20,
+		MinP:        0,
 	}
+}
+
+// WithTopP returns a new CompletionOptions with TopP set.
+func (o *CompletionOptions) WithTopP(topP float64) *CompletionOptions {
+	o.TopP = topP
+	return o
+}
+
+// WithTopK returns a new CompletionOptions with TopK set.
+func (o *CompletionOptions) WithTopK(topK int) *CompletionOptions {
+	o.TopK = topK
+	return o
+}
+
+// WithMinP returns a new CompletionOptions with MinP set.
+func (o *CompletionOptions) WithMinP(minP float64) *CompletionOptions {
+	o.MinP = minP
+	return o
 }
 
 // WithMaxTokens returns a new CompletionOptions with MaxTokens set.
