@@ -440,6 +440,16 @@ type oaiMessage struct {
 	// reasoning model's <think> block out of Content. Only read on responses; never set on
 	// outgoing request messages.
 	ReasoningContent *string `json:"reasoning_content,omitempty"`
+
+	// Reasoning is the same thing under Ollama's OpenAI-compat endpoint's field name — confirmed
+	// directly against a running Ollama server: a truncated-by-length response comes back as
+	// {"content":"","reasoning":"...","finish_reason":"length"}, never reasoning_content. Without
+	// this, finalText's fallback below never matches on Ollama, and a reasoning model that spends
+	// its whole response budget thinking (more likely right after a PreModel hook like Compaction
+	// hands it a context shaped differently than the previous round, which can prompt a longer
+	// think) surfaces as a hard "LLM returned empty response" instead of recovering the thinking
+	// text, even though the server sent real content.
+	Reasoning *string `json:"reasoning,omitempty"`
 }
 
 // contentString returns Content, treating a nil pointer (tool-call-only assistant messages
@@ -462,14 +472,20 @@ func stripThinking(s string) string {
 
 // finalText returns the message's answer text with any inline <think> block removed. If that
 // leaves nothing — e.g. the model spent its whole token budget thinking and never reached an
-// answer, or a server splits reasoning into ReasoningContent but the answer landed there too —
-// it falls back to a cleaned ReasoningContent rather than reporting an empty response.
+// answer, or a server splits reasoning into a separate field but the answer landed there too —
+// it falls back to cleaned reasoning text (checking both field names servers actually use —
+// ReasoningContent and Reasoning) rather than reporting an empty response.
 func (m oaiMessage) finalText() string {
 	if clean := stripThinking(m.contentString()); clean != "" {
 		return clean
 	}
 	if m.ReasoningContent != nil {
-		return stripThinking(*m.ReasoningContent)
+		if clean := stripThinking(*m.ReasoningContent); clean != "" {
+			return clean
+		}
+	}
+	if m.Reasoning != nil {
+		return stripThinking(*m.Reasoning)
 	}
 	return ""
 }

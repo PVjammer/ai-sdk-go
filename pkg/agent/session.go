@@ -2,6 +2,10 @@ package agent
 
 import (
 	"context"
+	"fmt"
+	"regexp"
+	"sort"
+	"strings"
 	"sync"
 
 	"github.com/pvjammer/ai-sdk-go/pkg/llm"
@@ -27,13 +31,20 @@ type sessionSeeder interface {
 // share one AIAgent instance across multiple Sessions — AgentBase's hooks are a single field
 // per agent instance, not per session, so two Sessions sharing an agent would stomp on each
 // other's steering. Give each Session its own agent instance.
+//
+// Send is not designed for concurrent turns on the same Session: two overlapping Send calls
+// would both read the same starting leaf and race to append/advance it when branching is
+// enabled. Steer and SendFollowUp are safe to call while a Send is in flight — that's their
+// purpose — but don't call Send again until the previous one's channel has closed.
 type Session struct {
 	id     string
 	agent  AIAgent
 	seeder sessionSeeder // nil if agent doesn't implement it — branching degrades gracefully
 
-	log  *SessionLog // nil disables branching entirely
-	leaf string      // this spine's current position in log; meaningless if log == nil
+	log *SessionLog // nil disables branching entirely
+
+	leafMu sync.Mutex
+	leaf   string // this spine's current position in log; meaningless if log == nil
 
 	steerCh chan string
 
@@ -85,8 +96,13 @@ func NewSession(id string, a AIAgent, cfg SessionConfig) *Session {
 func (s *Session) ID() string { return s.id }
 
 // Leaf returns this spine's current position in its SessionLog. Meaningless if the session has
-// no SessionLog attached.
-func (s *Session) Leaf() string { return s.leaf }
+// no SessionLog attached. Safe to call while a Send is in flight — reads the same
+// mutex-guarded field sendBranched writes.
+func (s *Session) Leaf() string {
+	s.leafMu.Lock()
+	defer s.leafMu.Unlock()
+	return s.leaf
+}
 
 // Log returns the attached SessionLog, or nil if branching is disabled.
 func (s *Session) Log() *SessionLog { return s.log }
@@ -206,17 +222,21 @@ func forward(events <-chan Event, out chan<- Event) {
 // turn has actually run, since there's no reliable way to know up front whether a turn will need
 // tools.
 func (s *Session) sendBranched(ctx context.Context, message string, out chan<- Event) {
-	trunkLeaf := s.leaf
+	trunkLeaf := s.Leaf()
 	scratchID := s.id + "#scratch-" + newEntryID()
 	seedHistory := EntriesToMessages(s.log.Path(trunkLeaf))
 	s.seeder.SeedSession(scratchID, seedHistory)
 
 	toolCalls := 0
+	var calls []ToolCallEvent
 	var finalText string
 	for ev := range s.agent.Run(ctx, scratchID, message) {
 		switch ev.Type {
 		case EventToolCall:
 			toolCalls++
+			if tc, ok := ev.Data.(ToolCallEvent); ok {
+				calls = append(calls, tc)
+			}
 		case EventResponse:
 			if r, ok := ev.Data.(ResponseEvent); ok && r.Done {
 				finalText = r.Content
@@ -248,20 +268,226 @@ func (s *Session) sendBranched(ctx context.Context, message string, out chan<- E
 
 	if toolCalls == 0 {
 		// No scratch work worth hiding — the exchange joins the spine directly.
-		s.leaf = cursor
+		s.setLeaf(cursor)
 		return
 	}
 
 	// Merge: the spine gets a tool-message branch reference, not the branch's own content. The
 	// branch (everything just appended above, rooted at trunkLeaf) stays in the log as a
-	// sibling subtree, retrievable later via a read_branch(branchRoot) tool call.
+	// sibling subtree, retrievable later via read_branch.
+	//
+	// Round 1 of this made the reference self-describing but still keyed on the raw branch ID
+	// (a 16-char random hex string) as the thing the model had to notice and copy — which turned
+	// out to be its own failure mode (a model that DID try to retrieve copied a literal example
+	// ID from a prompt instead of the real one). This round gives the model a short, sequential
+	// label (B1, B2, ...) to use instead — easier to get right than 16 hex characters — and
+	// pushes full discovery onto a separate list_branches tool/catalog rather than relying
+	// purely on the model noticing and re-parsing this inline text, which degrades once history
+	// is long or compacted. The real ID still lives in the content, in a machine-parseable
+	// {ref:<id>} marker (ParseBranchRef), for read_branch to resolve a label against — the model
+	// is never expected to read or use that part directly.
+	label := fmt.Sprintf("B%d", countBranches(s.log)+1)
+	did, mentions := summarizeToolCalls(calls)
+	content := fmt.Sprintf("branch %s: did %s", label, did)
+	if mentions != "" {
+		content += " [mentions: " + mentions + "]"
+	}
+	content += " {ref:" + branchRoot + "}"
+
 	ref := s.log.Append(trunkLeaf, Entry{
 		Role:     "tool",
 		ToolName: "turn_scratch",
-		Content:  "ref:" + branchRoot,
+		Content:  content,
 	})
 	ans := s.log.Append(ref.ID, Entry{Role: "assistant", Content: finalText})
-	s.leaf = ans.ID
+	s.setLeaf(ans.ID)
+}
+
+// setLeaf updates this spine's current log position under leafMu. See the field doc comment on
+// Session.leaf — reads go through Leaf(), which uses the same lock.
+func (s *Session) setLeaf(id string) {
+	s.leafMu.Lock()
+	defer s.leafMu.Unlock()
+	s.leaf = id
+}
+
+// summarizeToolCalls renders a branch's tool calls as (did, mentions): did is a short
+// "tool(firstArg)" list for a quick sense of WHAT HAPPENED (capped at 6 calls so one very chatty
+// turn can't produce an unbounded trunk entry); mentions is every distinct string-ish argument
+// value across ALL calls and args, deduplicated — so matching "what was beta's value" against
+// a breadcrumb is closer to a plain string match than an inference the model has to make from
+// tool names alone.
+func summarizeToolCalls(calls []ToolCallEvent) (did, mentions string) {
+	if len(calls) == 0 {
+		return "nothing — plain exchange", ""
+	}
+	const maxShown = 6
+	shown := calls
+	truncated := false
+	if len(shown) > maxShown {
+		shown = shown[:maxShown]
+		truncated = true
+	}
+	parts := make([]string, 0, len(shown))
+	seen := make(map[string]bool)
+	var mentionList []string
+	for _, c := range calls { // mentions scans ALL calls, not just the shown/capped subset
+		for _, v := range stringArgValues(c.Input) {
+			if !seen[v] {
+				seen[v] = true
+				mentionList = append(mentionList, v)
+			}
+		}
+	}
+	for _, c := range shown {
+		parts = append(parts, c.ToolName+"("+firstArgSummary(c.Input)+")")
+	}
+	did = strings.Join(parts, ", ")
+	if truncated {
+		did += ", ..."
+	}
+	return did, strings.Join(mentionList, ", ")
+}
+
+// firstArgSummary returns "key=value" for the first argument (by sorted key) of a tool call's
+// input map, or "" if Input isn't a map or is empty — just enough to distinguish
+// "lookup_fact(topic=alpha)" from "lookup_fact(topic=beta)", not a full argument dump.
+func firstArgSummary(input interface{}) string {
+	m, ok := input.(map[string]interface{})
+	if !ok || len(m) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	k := keys[0]
+	return k + "=" + truncateVal(fmt.Sprintf("%v", m[k]))
+}
+
+// freeTextArgKeys are argument names conventionally holding prose/payload content rather than a
+// short identifier — excluded from the mentions list, which is meant to be scannable labels
+// (topics, paths, names), not truncated paragraph fragments.
+var freeTextArgKeys = map[string]bool{"content": true, "text": true, "body": true, "message": true}
+
+// stringArgValues returns every short, identifier-shaped string argument value in a tool call's
+// input map, in sorted-key order, for summarizeToolCalls' mentions list — skipping
+// freeTextArgKeys and anything too long to plausibly be an identifier rather than prose.
+func stringArgValues(input interface{}) []string {
+	m, ok := input.(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make([]string, 0, len(keys))
+	for _, k := range keys {
+		if freeTextArgKeys[strings.ToLower(k)] {
+			continue
+		}
+		if v, ok := m[k].(string); ok && v != "" && len(v) <= 60 {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+func truncateVal(v string) string {
+	if len(v) > 40 {
+		return v[:40] + "..."
+	}
+	return v
+}
+
+// branchRefPattern extracts the real branch ID from a turn_scratch entry's trailing {ref:<id>}
+// marker — the only machine-parseable part of the content; everything else is model-facing
+// prose the model is never expected to parse structurally.
+var branchRefPattern = regexp.MustCompile(`\{ref:([^}]+)\}`)
+
+// ParseBranchRef extracts the real branch (root entry) ID from a turn_scratch reference's
+// Content. ok is false if content isn't a recognizable ref.
+func ParseBranchRef(content string) (id string, ok bool) {
+	m := branchRefPattern.FindStringSubmatch(content)
+	if m == nil {
+		return "", false
+	}
+	return m[1], true
+}
+
+// branchLabelPattern extracts the short "B<n>" label a model is told to use with read_branch,
+// from a turn_scratch entry's leading "branch B<n>:" text.
+var branchLabelPattern = regexp.MustCompile(`^branch (B\d+):`)
+
+// ParseBranchLabel extracts a turn_scratch reference's short label (e.g. "B3"). ok is false if
+// content doesn't start with the expected "branch B<n>:" prefix.
+func ParseBranchLabel(content string) (label string, ok bool) {
+	m := branchLabelPattern.FindStringSubmatch(content)
+	if m == nil {
+		return "", false
+	}
+	return m[1], true
+}
+
+// BranchInfo is one entry in ListBranches' catalog: a label a model can pass to read_branch,
+// the real underlying ID, and the reference's full display text (breadcrumb + mentions).
+type BranchInfo struct {
+	Label   string
+	RootID  string
+	Content string
+}
+
+// countBranches returns how many turn_scratch references already exist in log — used to assign
+// the next one's label deterministically (see sendBranched). Recomputed from the log itself
+// rather than an in-memory counter, so labels stay consistent across process restarts (a fresh
+// process has no memory of a prior counter, but the persisted log still has every past ref).
+func countBranches(log *SessionLog) int {
+	n := 0
+	for _, e := range log.Entries() {
+		if e.Role == "tool" && e.ToolName == "turn_scratch" {
+			n++
+		}
+	}
+	return n
+}
+
+// ListBranches catalogs every branch reference in log, in creation order, labeled B1, B2, ... —
+// a model's primary way to discover what's retrievable without having to notice and re-parse an
+// inline breadcrumb from potentially-distant (or compacted-away) history. Register this as a
+// tool alongside read_branch; see examples/tui-agent for the pairing.
+func ListBranches(log *SessionLog) []BranchInfo {
+	var refs []Entry
+	for _, e := range log.Entries() {
+		if e.Role == "tool" && e.ToolName == "turn_scratch" {
+			refs = append(refs, e)
+		}
+	}
+	sort.Slice(refs, func(i, j int) bool { return refs[i].CreatedAt.Before(refs[j].CreatedAt) })
+
+	out := make([]BranchInfo, 0, len(refs))
+	for i, e := range refs {
+		id, _ := ParseBranchRef(e.Content)
+		out = append(out, BranchInfo{Label: fmt.Sprintf("B%d", i+1), RootID: id, Content: e.Content})
+	}
+	return out
+}
+
+// ResolveBranch finds a branch by the label a model would pass to read_branch (e.g. "B3") or,
+// as a fallback for anything that still has a raw ID (older sessions, direct programmatic use),
+// by that ID directly. ok is false if neither matches anything in log.
+func ResolveBranch(log *SessionLog, labelOrID string) (rootID string, ok bool) {
+	for _, b := range ListBranches(log) {
+		if b.Label == labelOrID {
+			return b.RootID, true
+		}
+	}
+	if _, found := log.Get(labelOrID); found {
+		return labelOrID, true
+	}
+	return "", false
 }
 
 // ToolCallRecord is one tool invocation captured by AccumulateEvents.

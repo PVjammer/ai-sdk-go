@@ -4,16 +4,17 @@
 # docs/design/turn-branching.md, docs/design/working-memory.md, docs/design/session-dispatch.md.
 # Branch: agent-loop-v2. Implementation order: docs/roadmap.md.
 #
-# Updated 2026-10-16: Phases 1/3/5/6 and the typed-compaction half of Phase 2 are implemented and
-# tested (unit tests + a live run against a real endpoint via examples/tui-agent). Entries below
+# Updated 2026-10-16: Phases 1 (items 1-3 only — item 4, session snapshot/restore, is NOT built,
+# see below), 3, 5, 6, and the typed-compaction half of Phase 2 are implemented and tested (unit
+# tests + a live run against a real endpoint via examples/tui-agent). Entries below
 # are marked `# built` with real file:line where that happened; "proposed" entries are still only
 # designed. The two `??` open questions from the first draft are resolved — see their old
 # section, kept below with how each was actually decided, not deleted.
 
 ## Existing, stable — locked, not re-derived here
 
-AgentHooks   # locked — pkg/agent/hooks.go, base.go:256-268. Six call sites, this exact order,
-              # once per Run():
+AgentHooks   # locked — pkg/agent/hooks.go:9-22 (struct); base.go holds the field + Set/GetHooks.
+              # Six call sites, this exact order, once per Run():
   PreInput     func(ctx, sessionID, message string) (string, error)
   PreModel     func(ctx, messages []llm.ChatMessage) ([]llm.ChatMessage, error)
   PostModel    func(ctx, chunk llm.StreamChunk) (llm.StreamChunk, error)

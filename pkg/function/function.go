@@ -60,6 +60,12 @@ type AIFunction interface {
 	//
 	// Returns the result and any error that occurred during execution.
 	// If the context is canceled, implementations should return ctx.Err().
+	//
+	// When used as a tool via agent.AgentBase, Execute may be called concurrently with itself
+	// and with other tools' Execute calls: a model's tool-call batch runs in parallel by default
+	// (see AgentBase.SetSequentialTools to opt a tool out). Implementations with shared mutable
+	// state (an in-memory cache, a non-thread-safe client, a file handle) must guard it
+	// themselves; the agent loop does not serialize calls for you unless you opt in.
 	Execute(ctx context.Context, input interface{}) (interface{}, error)
 
 	// InputSchema returns the JSON Schema for input validation.

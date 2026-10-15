@@ -37,7 +37,7 @@
 // Tools available to the model: get_time, write_note/read_note (a session-scoped notes
 // directory, persisted alongside the session — write_note/read_note's names feed
 // DefaultFileOpsExtractor so a [compacted] line's read/modified file lists have something real
-// to show), and read_branch when branching is on. A [compacted] line prints live whenever the
+// to show), and list_branches/read_branch when branching is on. A [compacted] line prints live whenever the
 // Compaction hook actually fires.
 package main
 
@@ -62,6 +62,7 @@ import (
 // methods it doesn't provide on its own (see pkg/builtin/agents/simple for the same pattern).
 type tuiAgent struct {
 	agent.AgentBase
+	branchAware bool // true when branching is on and read_branch is actually registered
 }
 
 func (a *tuiAgent) Metadata() *agent.AgentMetadata {
@@ -69,11 +70,33 @@ func (a *tuiAgent) Metadata() *agent.AgentMetadata {
 }
 func (a *tuiAgent) Config() function.Config { return function.NilConfig{} }
 func (a *tuiAgent) Run(ctx context.Context, sessionID, message string) <-chan agent.Event {
-	return a.BaseRun(ctx, sessionID, message, systemPrompt, 15, false)
+	return a.BaseRun(ctx, sessionID, message, a.systemPrompt(), 15, false)
 }
 
-const systemPrompt = "You are a helpful assistant being used to test an agent SDK. Use the " +
-	"available tools when they'd genuinely help; don't call a tool just to demonstrate it."
+func (a *tuiAgent) systemPrompt() string {
+	p := "You are a helpful assistant being used to test an agent SDK. Use the " +
+		"available tools when they'd genuinely help; don't call a tool just to demonstrate it."
+	if !a.branchAware {
+		return p
+	}
+	// Round 1 (bare "ref:<id>", no explanation) failed outright: asked for a detail it had
+	// deliberately kept out of its own final answer, the model said it didn't have it, rather
+	// than considering retrieval at all — on both a small and a large local model, so this read
+	// as a missing affordance, not a capability gap worth solving with a bigger model. Round 2
+	// added a breadcrumb and this same paragraph, keyed on the raw ID as the thing to use —
+	// which produced a NEW failure: a model that did attempt retrieval copied a literal example
+	// ID from this very prompt instead of a real one from its own context. Round 3 (current):
+	// short sequential labels instead of raw IDs, and list_branches as the primary discovery
+	// tool instead of leaning on the model noticing and re-parsing inline breadcrumb text.
+	return p + " Some of your own earlier conversation history has been moved out of view to " +
+		"keep this context small, to make room for more conversation. If you need a specific " +
+		"fact, value, or detail from earlier and you don't see it stated plainly in your " +
+		"current context, call list_branches BEFORE concluding you don't have the information " +
+		"or redoing the original work — it shows you everything that's been moved out of view " +
+		"and a short label (like \"B2\") for each one. Then call read_branch with that exact " +
+		"label to pull back the full original exchange. Never guess, invent, or reuse a label " +
+		"or ID from an example — only ones list_branches actually shows you are real."
+}
 
 func defaultSessionDir() string {
 	home, err := os.UserHomeDir()
@@ -88,7 +111,17 @@ func main() {
 	model := flag.String("model", "Qwen3.6-35B-A3B", "model name as the endpoint reports it")
 	branching := flag.Bool("branching", true, "enable turn-scratch branching (docs/design/turn-branching.md)")
 	compact := flag.Bool("compaction", true, "enable LLM-summarization compaction (docs/design/compaction-v2.md)")
-	compactionTokens := flag.Int("compaction-tokens", 4000, "token budget compaction protects (estimated, 4 chars/token)")
+	contextWindow := flag.Int("context-window", 128000, "the model's REAL served context size — verify this against the "+
+		"endpoint/server, don't assume the architecture's advertised max (see ai-sdk-go session notes on Ollama's "+
+		"num_ctx vs. a model's reported context_length). Compaction's protected budget is a fraction of this, not a "+
+		"flat number, so it scales with whatever model you actually point --endpoint/--model at.")
+	compactionFraction := flag.Float64("compaction-fraction", 0.75, "fraction of --context-window compaction's "+
+		"protected budget uses (pi's analogous default reserves a fixed ~16K-token margin instead of a fraction; "+
+		"a fraction is simpler to reason about and scales the same way across very different context sizes)")
+	experimentTools := flag.Bool("experiment-tools", false, "register lookup_fact, a test-only tool for the "+
+		"branching-on-vs-off comparison (see experiment_tools.go)")
+	codingTools := flag.Bool("coding-tools", false, "register write_file/read_file/list_files/run_go_test, "+
+		"scoped to a per-session scratch Go module, for a real multi-turn implementation task (see coding_tools.go)")
 	sessionID := flag.String("session", "tui", "session identifier — reused across invocations to continue it")
 	sessionDir := flag.String("session-dir", defaultSessionDir(), "directory session files are saved/loaded from")
 	flag.Parse()
@@ -105,7 +138,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	a := &tuiAgent{}
+	a := &tuiAgent{branchAware: *branching}
 	a.InitBase(function.NilConfig{})
 	a.SetProvider(provider)
 
@@ -129,6 +162,30 @@ func main() {
 		fmt.Fprintf(os.Stderr, "register read_note: %v\n", err)
 		os.Exit(1)
 	}
+	if *experimentTools {
+		if err := a.RegisterTool(newLookupFactTool(notesDir)); err != nil {
+			fmt.Fprintf(os.Stderr, "register lookup_fact: %v\n", err)
+			os.Exit(1)
+		}
+	}
+	if *codingTools {
+		workDir := filepath.Join(*sessionDir, *sessionID+"-workdir")
+		if err := initCodingWorkdir(workDir); err != nil {
+			fmt.Fprintf(os.Stderr, "init coding workdir: %v\n", err)
+			os.Exit(1)
+		}
+		for _, err := range []error{
+			a.RegisterTool(newWriteFileTool(workDir)),
+			a.RegisterTool(newReadFileTool(workDir)),
+			a.RegisterTool(newListFilesTool(workDir)),
+			a.RegisterTool(newRunGoTestTool(workDir)),
+		} {
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "register coding tool: %v\n", err)
+				os.Exit(1)
+			}
+		}
+	}
 
 	loaded, found := loadSession(*sessionDir, *sessionID)
 	if found && loaded.branching != *branching {
@@ -151,14 +208,30 @@ func main() {
 			fmt.Fprintf(os.Stderr, "register read_branch: %v\n", err)
 			os.Exit(1)
 		}
+		if err := a.RegisterTool(newListBranchesTool(log)); err != nil {
+			fmt.Fprintf(os.Stderr, "register list_branches: %v\n", err)
+			os.Exit(1)
+		}
 	} else if found {
 		a.SeedSession(*sessionID, loaded.history)
 	}
 
+	// compactionBudget is the protected budget compaction triggers against — a FRACTION of the
+	// model's real context window, not a flat number, so it scales with whatever you actually
+	// point --endpoint/--model at instead of silently becoming a tiny sliver of a 96K+ model's
+	// real room (see ai-sdk-go session notes: the old flat 4000-token default was triggering
+	// compaction on nearly every round for any model with real headroom, which is what caused
+	// the repeated-compaction tool-call loop found during stress testing).
+	compactionBudget := int(float64(*contextWindow) * *compactionFraction)
+	// hardLimit is the backstop if compaction can't keep up — just under the model's REAL
+	// ceiling (not a multiple of compactionBudget, which would exceed contextWindow and defeat
+	// the point of a backstop), leaving a little headroom for the response itself.
+	hardLimit := int(float64(*contextWindow) * 0.95)
+
 	var hs []agent.AgentHooks
 	if *compact {
 		hs = append(hs, hooks.Compaction(&a.AgentBase, provider, hooks.CompactionOptions{
-			MaxTokens: *compactionTokens,
+			MaxTokens: compactionBudget,
 			OnCompaction: func(sessionID string, result hooks.CompactionResult) {
 				fmt.Printf("\n[compacted] %d -> ~%d tokens", result.TokensBefore, result.EstimatedTokensAfter)
 				if len(result.Details.ReadFiles) > 0 {
@@ -171,7 +244,7 @@ func main() {
 			},
 		}))
 	}
-	hs = append(hs, hooks.TokenLimit(*compactionTokens*2)) // hard backstop if compaction can't keep up
+	hs = append(hs, hooks.TokenLimit(hardLimit))
 	hs = append(hs, hooks.LargeResult(8192, "", "read_branch"))
 	a.SetHooks(hooks.Combine(hs...))
 
@@ -184,14 +257,16 @@ func main() {
 	}
 
 	if oneShotMessage != "" {
+		fmt.Fprintf(os.Stderr, "[config] model=%s branching=%v compaction=%v budget=%d window=%d\n",
+			*model, *branching, *compact, compactionBudget, *contextWindow)
 		fmt.Print("agent> ")
 		runTurn(context.Background(), sess, oneShotMessage)
 		persist()
 		return
 	}
 
-	fmt.Printf("=== TUI Agent === endpoint=%s model=%s branching=%v compaction=%v session=%s\n",
-		*endpoint, *model, *branching, *compact, *sessionID)
+	fmt.Printf("=== TUI Agent === endpoint=%s model=%s branching=%v compaction=%v (budget=%d/window=%d) session=%s\n",
+		*endpoint, *model, *branching, *compact, compactionBudget, *contextWindow, *sessionID)
 	if found {
 		fmt.Println("(continuing a saved session)")
 	}
@@ -286,7 +361,8 @@ func printLog(log *agent.SessionLog, leaf string) {
 	for _, e := range path {
 		switch {
 		case e.Role == "tool" && e.ToolName == "turn_scratch":
-			fmt.Printf("  [%s] branch reference -> %s  (see: /branch %s)\n", e.Role, e.Content, strings.TrimPrefix(e.Content, "ref:"))
+			id, _ := agent.ParseBranchRef(e.Content)
+			fmt.Printf("  [%s] branch reference -> %s  (see: /branch %s)\n", e.Role, e.Content, id)
 		default:
 			preview := e.Content
 			if len(preview) > 100 {
@@ -479,9 +555,13 @@ func (t *readBranchTool) Execute(ctx context.Context, input interface{}) (interf
 	if id == "" {
 		return nil, fmt.Errorf("branch_id is required")
 	}
-	subtree := t.log.Subtree(id)
+	rootID, ok := agent.ResolveBranch(t.log, id)
+	if !ok {
+		return nil, fmt.Errorf("no branch found for %q — call list_branches to see valid labels", id)
+	}
+	subtree := t.log.Subtree(rootID)
 	if len(subtree) == 0 {
-		return nil, fmt.Errorf("no branch found for id %q", id)
+		return nil, fmt.Errorf("no branch found for %q", id)
 	}
 	var sb strings.Builder
 	for _, e := range subtree {
@@ -493,13 +573,54 @@ func (t *readBranchTool) InputSchema() *function.Schema {
 	return &function.Schema{
 		Type: "object",
 		Properties: map[string]*function.Property{
-			"branch_id": {Type: "string", Description: "The branch ID from a turn_scratch reference (the part after \"ref:\")."},
+			"branch_id": {Type: "string", Description: "A branch label like \"B2\" — call list_branches first " +
+				"if you don't already know which one you need. Never guess or invent a label or ID."},
 		},
 		Required: []string{"branch_id"},
 	}
 }
 func (t *readBranchTool) Metadata() *function.Metadata {
 	m := function.NewMetadata("read_branch")
-	m.Description = "Retrieve the full content of an earlier turn's scratch work (reasoning and tool calls) by its branch ID."
+	m.Description = "Retrieve the full original content of an earlier turn's hidden scratch work (every tool call " +
+		"and result from that turn, not just its summary) by its branch label (call list_branches to see valid " +
+		"labels). Use this whenever you need a specific fact, value, or detail from earlier that isn't plainly " +
+		"visible in your current context — check list_branches BEFORE concluding you don't have the information, " +
+		"and before redoing the work by calling the original tool again."
+	return m
+}
+
+// listBranchesTool lets the model discover what's retrievable without having to notice and
+// re-parse an inline breadcrumb from potentially-distant or compacted-away history — a tool's
+// presence in the tool list doesn't degrade with context length the way re-reading history
+// does, so this is the primary, always-available discovery path; the inline breadcrumbs on the
+// trunk are a secondary, passive hint for a model that happens to be re-reading nearby history.
+type listBranchesTool struct {
+	function.Base
+	log *agent.SessionLog
+}
+
+func newListBranchesTool(log *agent.SessionLog) *listBranchesTool {
+	return &listBranchesTool{Base: function.NewBase(function.NilConfig{}), log: log}
+}
+func (t *listBranchesTool) Execute(ctx context.Context, _ interface{}) (interface{}, error) {
+	branches := agent.ListBranches(t.log)
+	if len(branches) == 0 {
+		return "No branches exist yet in this session.", nil
+	}
+	var sb strings.Builder
+	for _, b := range branches {
+		fmt.Fprintf(&sb, "%s: %s\n", b.Label, b.Content)
+	}
+	return sb.String(), nil
+}
+func (t *listBranchesTool) InputSchema() *function.Schema {
+	return &function.Schema{Type: "object", Properties: map[string]*function.Property{}}
+}
+func (t *listBranchesTool) Metadata() *function.Metadata {
+	m := function.NewMetadata("list_branches")
+	m.Description = "List every piece of earlier scratch work (tool calls and results) that's been moved out of " +
+		"your visible context, with a short note on what each one contains. Call this whenever you need a fact, " +
+		"value, or detail from earlier that you don't see stated plainly in front of you — before assuming it's " +
+		"lost, and before redoing the original work. Follow up with read_branch using the label shown here."
 	return m
 }

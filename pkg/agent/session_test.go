@@ -2,7 +2,6 @@ package agent_test
 
 import (
 	"context"
-	"strings"
 	"testing"
 	"time"
 
@@ -68,14 +67,20 @@ func TestSession_BranchesWhenToolCalled(t *testing.T) {
 	if len(path) != 2 {
 		t.Fatalf("expected trunk path length 2 (ref+answer), got %d: %+v", len(path), path)
 	}
-	if path[0].Role != "tool" || path[0].ToolName != "turn_scratch" || !strings.HasPrefix(path[0].Content, "ref:") {
+	if path[0].Role != "tool" || path[0].ToolName != "turn_scratch" {
 		t.Fatalf("expected a turn_scratch branch-reference entry first, got %+v", path[0])
+	}
+	if label, ok := agent.ParseBranchLabel(path[0].Content); !ok || label != "B1" {
+		t.Fatalf("expected label B1 on the first branch ref, got %q (ok=%v): %+v", label, ok, path[0])
 	}
 	if path[1].Role != "assistant" || path[1].Content != "scratch work done" {
 		t.Fatalf("expected the final answer entry second, got %+v", path[1])
 	}
 
-	branchID := strings.TrimPrefix(path[0].Content, "ref:")
+	branchID, ok := agent.ParseBranchRef(path[0].Content)
+	if !ok {
+		t.Fatalf("expected a parseable branch ref, got %q", path[0].Content)
+	}
 	subtree := log.Subtree(branchID)
 	if len(subtree) == 0 {
 		t.Fatal("expected the branch to be retrievable via Subtree")
