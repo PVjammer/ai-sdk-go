@@ -34,6 +34,10 @@ type AgentBase struct {
 	toolsMu sync.RWMutex
 	tools   map[string]function.AIFunction
 
+	// sequentialTools marks tool names that must not run concurrently with the rest of their
+	// batch. See SetSequentialTools and docs/design/turn-branching.md's "Tool-call concurrency".
+	sequentialTools map[string]bool
+
 	// approvalFunc is called before each tool execution (optional).
 	approvalFunc func(toolName string, input interface{}) (bool, error)
 
@@ -88,6 +92,32 @@ func (b *AgentBase) GetHooks() AgentHooks {
 // system prompt on every Run() call, making skills discoverable by the model.
 func (b *AgentBase) SetSkillLoader(loader *skill.SkillLoader) {
 	b.skillLoader = loader
+}
+
+// SetSequentialTools marks tool names whose batch must run sequentially rather than
+// concurrently with the rest of that round's tool calls. Tool-call batches are parallel by
+// default (docs/design/turn-branching.md); a batch containing ANY sequential-tagged tool runs
+// the WHOLE batch sequentially, not just that one call — matching pi's model.
+func (b *AgentBase) SetSequentialTools(names ...string) {
+	b.toolsMu.Lock()
+	defer b.toolsMu.Unlock()
+	if b.sequentialTools == nil {
+		b.sequentialTools = make(map[string]bool)
+	}
+	for _, n := range names {
+		b.sequentialTools[n] = true
+	}
+}
+
+func (b *AgentBase) batchIsSequential(calls []llm.ToolCall) bool {
+	b.toolsMu.RLock()
+	defer b.toolsMu.RUnlock()
+	for _, tc := range calls {
+		if b.sequentialTools[tc.Name] {
+			return true
+		}
+	}
+	return false
 }
 
 // RegisterTool adds an AIFunction as a tool available to the agent.
@@ -165,6 +195,39 @@ func (b *AgentBase) ClearSession(sessionID string) {
 	b.sessionsMu.Lock()
 	defer b.sessionsMu.Unlock()
 	delete(b.sessions, sessionID)
+}
+
+// SeedSession creates (or replaces) a session with the given initial history,
+// without running a turn. Used by Session/turn-branching (docs/design/turn-branching.md) to
+// prime a scratch session with a path through a SessionLog before running a turn against it —
+// the scratch session is otherwise an ordinary AgentBase session and sees normal hook
+// processing on its next Run().
+func (b *AgentBase) SeedSession(sessionID string, history []llm.ChatMessage) {
+	b.sessionsMu.Lock()
+	defer b.sessionsMu.Unlock()
+
+	seeded := make([]llm.ChatMessage, len(history))
+	copy(seeded, history)
+	b.sessions[sessionID] = &agentSession{
+		history:      seeded,
+		lastAccessed: time.Now(),
+	}
+}
+
+// SessionHistory returns a copy of a session's current message history. Used by
+// Session/turn-branching to read back what a scratch session accumulated after a turn, before
+// the scratch session is discarded via ClearSession.
+func (b *AgentBase) SessionHistory(sessionID string) []llm.ChatMessage {
+	b.sessionsMu.RLock()
+	defer b.sessionsMu.RUnlock()
+
+	s, ok := b.sessions[sessionID]
+	if !ok {
+		return nil
+	}
+	out := make([]llm.ChatMessage, len(s.history))
+	copy(out, s.history)
+	return out
 }
 
 // StartAutoCleanup starts a background goroutine to remove stale sessions.
@@ -265,6 +328,7 @@ func (b *AgentBase) BaseRun(
 //  7. executeTool
 //  8. [EventToolResult emitted with raw output]
 //  9. PostTool   — transforms result string before history append
+//
 // 10. PostResponse — called with final text response (non-fatal errors)
 func (b *AgentBase) executeAgentLoop(
 	ctx context.Context,
@@ -388,139 +452,44 @@ func (b *AgentBase) executeAgentLoop(
 				ToolCalls: finalChunk.ToolCalls,
 			})
 
-			// Execute each tool call
-			for _, tc := range finalChunk.ToolCalls {
-				// ── EventToolCall (announce what the model requested) ──────
+			calls := finalChunk.ToolCalls
+
+			// Announce every call in request order before dispatch, regardless of
+			// execution mode, so an observer always learns what was requested in the
+			// order the model asked for it.
+			for _, tc := range calls {
 				events <- Event{
 					Type:      EventToolCall,
 					Data:      ToolCallEvent{ToolName: tc.Name, Input: tc.Args},
 					Timestamp: time.Now(),
 				}
+			}
 
-				// ── Hook: PreTool ──────────────────────────────────────────
-				// Runs after EventToolCall so the observer already knows what
-				// the model asked for. Can modify args or silently deny.
-				if b.hooks.PreTool != nil {
-					modifiedCall, proceed, err := b.hooks.PreTool(ctx, tc)
-					if err != nil {
-						events <- Event{
-							Type: EventToolResult,
-							Data: ToolResultEvent{
-								ToolName: tc.Name,
-								Error:    fmt.Errorf("PreTool hook error: %w", err),
-							},
-							Timestamp: time.Now(),
-						}
-						session.history = append(session.history, llm.ChatMessage{
-							Role:       "tool",
-							Content:    fmt.Sprintf("error: PreTool hook failed for %s: %v", tc.Name, err),
-							ToolCallID: tc.ID,
-							ToolName:   tc.Name,
-						})
-						continue
-					}
-					if !proceed {
-						events <- Event{
-							Type: EventToolResult,
-							Data: ToolResultEvent{
-								ToolName: tc.Name,
-								Error:    fmt.Errorf("tool execution denied by PreTool hook"),
-							},
-							Timestamp: time.Now(),
-						}
-						session.history = append(session.history, llm.ChatMessage{
-							Role:       "tool",
-							Content:    fmt.Sprintf("denied: %s was blocked by a hook", tc.Name),
-							ToolCallID: tc.ID,
-							ToolName:   tc.Name,
-						})
-						continue
-					}
-					tc = modifiedCall // use the (possibly modified) call going forward
+			// Tool calls run in parallel by default (docs/design/turn-branching.md): every
+			// call in the batch executes concurrently, EventToolResult fires in whatever
+			// order calls actually finish, but results are written into history in the
+			// assistant's ORIGINAL REQUEST ORDER below — the model never sees results out
+			// of order even though they may have finished out of order. A batch containing
+			// any tool registered via SetSequentialTools runs entirely sequentially instead.
+			results := make([]llm.ChatMessage, len(calls))
+			if b.batchIsSequential(calls) {
+				for i, tc := range calls {
+					results[i] = b.runToolCall(ctx, tc, events)
 				}
-
-				// ── approvalFunc (backward-compat; runs after PreTool) ─────
-				if b.approvalFunc != nil {
-					approved, approvalErr := b.approvalFunc(tc.Name, tc.Args)
-					if approvalErr != nil {
-						events <- Event{
-							Type: EventToolResult,
-							Data: ToolResultEvent{
-								ToolName: tc.Name,
-								Error:    fmt.Errorf("approval error: %w", approvalErr),
-							},
-							Timestamp: time.Now(),
-						}
-						session.history = append(session.history, llm.ChatMessage{
-							Role:       "tool",
-							Content:    fmt.Sprintf("error: approval failed for %s", tc.Name),
-							ToolCallID: tc.ID,
-							ToolName:   tc.Name,
-						})
-						continue
-					}
-					if !approved {
-						events <- Event{
-							Type: EventToolResult,
-							Data: ToolResultEvent{
-								ToolName: tc.Name,
-								Error:    fmt.Errorf("tool execution denied by user"),
-							},
-							Timestamp: time.Now(),
-						}
-						session.history = append(session.history, llm.ChatMessage{
-							Role:       "tool",
-							Content:    fmt.Sprintf("denied: user did not approve %s", tc.Name),
-							ToolCallID: tc.ID,
-							ToolName:   tc.Name,
-						})
-						continue
-					}
+			} else {
+				var wg sync.WaitGroup
+				wg.Add(len(calls))
+				for i, tc := range calls {
+					go func(i int, tc llm.ToolCall) {
+						defer wg.Done()
+						results[i] = b.runToolCall(ctx, tc, events)
+					}(i, tc)
 				}
+				wg.Wait()
+			}
 
-				// Execute the tool
-				output, execErr := b.executeTool(ctx, tc)
-
-				// ── EventToolResult (raw output — UI sees the real result) ─
-				events <- Event{
-					Type:      EventToolResult,
-					Data:      ToolResultEvent{ToolName: tc.Name, Output: output, Error: execErr},
-					Timestamp: time.Now(),
-				}
-
-				// Marshal result to string for history
-				var resultContent string
-				if execErr != nil {
-					resultContent = fmt.Sprintf("error: %v", execErr)
-				} else {
-					resultBytes, marshalErr := json.Marshal(output)
-					if marshalErr != nil {
-						resultContent = fmt.Sprintf("%v", output)
-					} else {
-						resultContent = string(resultBytes)
-					}
-				}
-
-				// ── Hook: PostTool ─────────────────────────────────────────
-				// Transforms result string before it enters history.
-				// The model sees the hook's output; the UI already saw the raw
-				// output via EventToolResult above.
-				if b.hooks.PostTool != nil {
-					modified, hookErr := b.hooks.PostTool(ctx, tc.Name, resultContent, execErr)
-					if hookErr != nil {
-						resultContent = fmt.Sprintf("error: PostTool hook failed: %v", hookErr)
-					} else {
-						resultContent = modified
-					}
-				}
-
-				// Add tool result to history
-				session.history = append(session.history, llm.ChatMessage{
-					Role:       "tool",
-					Content:    resultContent,
-					ToolCallID: tc.ID,
-					ToolName:   tc.Name,
-				})
+			for _, m := range results {
+				session.history = append(session.history, m)
 			}
 
 			// Continue loop: let the model respond now that it has tool results
@@ -576,5 +545,120 @@ func (b *AgentBase) executeAgentLoop(
 			Message: fmt.Sprintf("Agent exceeded maximum iterations (%d)", maxIterations),
 		},
 		Timestamp: time.Now(),
+	}
+}
+
+// runToolCall executes one tool call end to end — PreTool, approval, execution, PostTool — and
+// emits EventToolResult itself (EventToolCall has already been announced by the caller, in
+// request order, before any call in the batch is dispatched). Safe to run concurrently with
+// other calls from the same batch: it only touches its own tc/events parameters and the
+// session's tool registry/hooks, which are read-only from here (events is a buffered channel,
+// safe for concurrent sends; the caller writes the returned message into session.history itself,
+// serially, after every call in the batch has finished).
+func (b *AgentBase) runToolCall(ctx context.Context, tc llm.ToolCall, events chan<- Event) llm.ChatMessage {
+	// ── Hook: PreTool ──────────────────────────────────────────────────────
+	// Can modify args or silently deny.
+	if b.hooks.PreTool != nil {
+		modifiedCall, proceed, err := b.hooks.PreTool(ctx, tc)
+		if err != nil {
+			events <- Event{
+				Type:      EventToolResult,
+				Data:      ToolResultEvent{ToolName: tc.Name, Error: fmt.Errorf("PreTool hook error: %w", err)},
+				Timestamp: time.Now(),
+			}
+			return llm.ChatMessage{
+				Role:       "tool",
+				Content:    fmt.Sprintf("error: PreTool hook failed for %s: %v", tc.Name, err),
+				ToolCallID: tc.ID,
+				ToolName:   tc.Name,
+			}
+		}
+		if !proceed {
+			events <- Event{
+				Type:      EventToolResult,
+				Data:      ToolResultEvent{ToolName: tc.Name, Error: fmt.Errorf("tool execution denied by PreTool hook")},
+				Timestamp: time.Now(),
+			}
+			return llm.ChatMessage{
+				Role:       "tool",
+				Content:    fmt.Sprintf("denied: %s was blocked by a hook", tc.Name),
+				ToolCallID: tc.ID,
+				ToolName:   tc.Name,
+			}
+		}
+		tc = modifiedCall // use the (possibly modified) call going forward
+	}
+
+	// ── approvalFunc (backward-compat; runs after PreTool) ─────────────────
+	if b.approvalFunc != nil {
+		approved, approvalErr := b.approvalFunc(tc.Name, tc.Args)
+		if approvalErr != nil {
+			events <- Event{
+				Type:      EventToolResult,
+				Data:      ToolResultEvent{ToolName: tc.Name, Error: fmt.Errorf("approval error: %w", approvalErr)},
+				Timestamp: time.Now(),
+			}
+			return llm.ChatMessage{
+				Role:       "tool",
+				Content:    fmt.Sprintf("error: approval failed for %s", tc.Name),
+				ToolCallID: tc.ID,
+				ToolName:   tc.Name,
+			}
+		}
+		if !approved {
+			events <- Event{
+				Type:      EventToolResult,
+				Data:      ToolResultEvent{ToolName: tc.Name, Error: fmt.Errorf("tool execution denied by user")},
+				Timestamp: time.Now(),
+			}
+			return llm.ChatMessage{
+				Role:       "tool",
+				Content:    fmt.Sprintf("denied: user did not approve %s", tc.Name),
+				ToolCallID: tc.ID,
+				ToolName:   tc.Name,
+			}
+		}
+	}
+
+	// Execute the tool
+	output, execErr := b.executeTool(ctx, tc)
+
+	// ── EventToolResult (raw output — UI sees the real result) ─────────────
+	events <- Event{
+		Type:      EventToolResult,
+		Data:      ToolResultEvent{ToolName: tc.Name, Output: output, Error: execErr},
+		Timestamp: time.Now(),
+	}
+
+	// Marshal result to string for history
+	var resultContent string
+	if execErr != nil {
+		resultContent = fmt.Sprintf("error: %v", execErr)
+	} else {
+		resultBytes, marshalErr := json.Marshal(output)
+		if marshalErr != nil {
+			resultContent = fmt.Sprintf("%v", output)
+		} else {
+			resultContent = string(resultBytes)
+		}
+	}
+
+	// ── Hook: PostTool ──────────────────────────────────────────────────────
+	// Transforms result string before it enters history. The model sees the hook's
+	// output; the UI already saw the raw output via EventToolResult above.
+	if b.hooks.PostTool != nil {
+		modified, hookErr := b.hooks.PostTool(ctx, tc.Name, resultContent, execErr)
+		if hookErr != nil {
+			resultContent = fmt.Sprintf("error: PostTool hook failed: %v", hookErr)
+		} else {
+			resultContent = modified
+		}
+	}
+
+	return llm.ChatMessage{
+		Role:       "tool",
+		Content:    resultContent,
+		ToolCallID: tc.ID,
+		ToolName:   tc.Name,
 	}
 }

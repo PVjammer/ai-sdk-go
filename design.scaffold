@@ -1,0 +1,173 @@
+# design.scaffold
+# ai-sdk-go — cross-cutting data structures and abstractions used by more than one package.
+# Companion docs (fuller rationale, not restated here): docs/design/compaction-v2.md,
+# docs/design/turn-branching.md, docs/design/working-memory.md, docs/design/session-dispatch.md.
+# Branch: agent-loop-v2. Implementation order: docs/roadmap.md.
+#
+# Updated 2026-10-16: Phases 1/3/5/6 and the typed-compaction half of Phase 2 are implemented and
+# tested (unit tests + a live run against a real endpoint via examples/tui-agent). Entries below
+# are marked `# built` with real file:line where that happened; "proposed" entries are still only
+# designed. The two `??` open questions from the first draft are resolved — see their old
+# section, kept below with how each was actually decided, not deleted.
+
+## Existing, stable — locked, not re-derived here
+
+AgentHooks   # locked — pkg/agent/hooks.go, base.go:256-268. Six call sites, this exact order,
+              # once per Run():
+  PreInput     func(ctx, sessionID, message string) (string, error)
+  PreModel     func(ctx, messages []llm.ChatMessage) ([]llm.ChatMessage, error)
+  PostModel    func(ctx, chunk llm.StreamChunk) (llm.StreamChunk, error)
+  PreTool      func(ctx, call llm.ToolCall) (llm.ToolCall, bool, error)   # bool = proceed
+  PostTool     func(ctx, toolName, result string, execErr error) (string, error)
+  PostResponse func(ctx, finalText string) error   # non-fatal: errors don't abort the turn
+
+abstraction CompressionHook   # locked — pkg/agentcontext, already shipped (extended.go)
+  func Priority() int
+  func ShouldCompress(ctx Extended) bool
+  func Compress(ctx Extended) (Extended, error)
+  "NOT used by the new Compaction hook below — see the first resolved ?? at the bottom. Still
+   locked/unchanged; this branch just doesn't build on it."
+
+## Built this branch
+
+Usage   # built — pkg/llm/usage.go. Plain token-count struct, NOT the agent.AgentHooks-shaped
+         # TokenCounter originally sketched below (that part is still only proposed).
+  PromptTokens int
+  CompletionTokens int
+  TotalTokens int
+  func UsageFromChunk(c StreamChunk) Usage
+  func UsageFromResponse(r *Response) Usage
+
+Entry   # built — pkg/agent/sessionlog.go. Lives in pkg/agent, not a new package (the first ??
+         # below covers why).
+  ID string
+  ParentID string   # "" marks a root entry
+  Role "user" | "assistant" | "tool" | "system"
+  Content string
+  ToolCalls []llm.ToolCall
+  ToolCallID string
+  ToolName string
+  CreatedAt time.Time
+
+SessionLog   # built — pkg/agent/sessionlog.go. A concrete type, not an abstraction — the
+              # original sketch's `branchFrom` turned out to need no state of its own (see its
+              # doc comment: a "leaf" is just an Entry ID, so "branching" is just appending
+              # somewhere other than whatever the caller currently considers current — the log
+              # itself has no notion of "the" current position at all, only Session does).
+  func Append(parentID string, e Entry) Entry   # parentID "" starts a new root; e.ID/CreatedAt
+                                                  # filled in if zero
+  func Get(id string) (Entry, bool)
+  func Children(parentID string) []Entry
+  func Path(leafID string) []Entry      # root-to-leaf — the live context for a model call
+  func Subtree(rootID string) []Entry   # rootID + every descendant, pre-order — what
+                                          # read_branch renders
+  func EntriesToMessages(entries []Entry) []llm.ChatMessage
+  func MessageToEntry(m llm.ChatMessage) Entry
+
+"branch-pointer messages are ordinary tool messages (role=tool, ToolName='turn_scratch',
+ Content='ref:<branchID>') — not a new Entry.role, exactly as designed. Confirmed working
+ end-to-end against a real model, not just unit tests: pkg/agent/session_test.go plus a live run
+ via examples/tui-agent."
+
+Session   # built — pkg/agent/session.go
+  func NewSession(id string, a AIAgent, cfg SessionConfig) *Session
+  func (s *Session) Send(ctx, message string) <-chan Event
+  func (s *Session) Steer(message string)       # non-blocking; dropped if the steer buffer is full
+  func (s *Session) SendFollowUp(message string)
+  func (s *Session) Leaf() string
+  func (s *Session) Log() *SessionLog
+  "Steer is implemented as a PreModel hook layered over whatever hooks the agent already had,
+   installed once at NewSession — NOT a change to executeAgentLoop itself, since PreModel already
+   fires at exactly the right point (between tool-call rounds, before the next LLM call). This
+   does mean a Session takes ownership of its agent's hooks for the Session's lifetime; don't
+   share one AIAgent instance across multiple Sessions (session.go's doc comment states this
+   plainly as a real constraint, not a footnote)."
+
+SessionConfig
+  Log *SessionLog     # nil disables turn-scratch branching entirely
+  Leaf string          # this spine's starting position; "" for a fresh log
+  SteerBuffer int      # default 4
+
+sessionSeeder   # built, unexported — pkg/agent/session.go. The narrow interface Session needs
+                 # from an agent to support branching; satisfied by AgentBase's own promoted
+                 # methods below, so any AgentBase-embedding agent gets it for free.
+  func SeedSession(sessionID string, history []llm.ChatMessage)   # built — base.go
+  func SessionHistory(sessionID string) []llm.ChatMessage          # built — base.go
+
+CompactionResult   # built — pkg/agent/hooks/compaction.go. Smaller than the original sketch:
+                    # NO FirstKeptEntryID (see its doc comment — this compaction operates on
+                    # AgentBase's flat history, not a SessionLog, so there is no entry ID to
+                    # report; a SessionLog-aware compaction variant would add it, not built here).
+  Summary string
+  TokensBefore int
+  EstimatedTokensAfter int
+  Usage llm.Usage
+  Details CompactionDetails
+
+CompactionDetails
+  ReadFiles []string
+  ModifiedFiles []string
+  "grows per agent, exactly as sketched — FileOpsExtractor (below) is the seam for an agent
+   whose tools don't match the default naming convention"
+
+FileOpsExtractor func(tc llm.ToolCall) (read []string, modified []string)   # built
+  "DefaultFileOpsExtractor ships as a reasonable convention (name contains write/edit/create ->
+   modified, read/list -> read, looks for a path/file/filename string arg) — override via
+   CompactionOptions.ExtractFileOps, don't fork the hook for a different tool vocabulary"
+
+func Compaction(base historyReplacer, summarizer llm.Provider, opts CompactionOptions) agent.AgentHooks   # built
+  # unquoted — hard requirements, verified by test (compaction_test.go), not just asserted:
+  # - never compacts the in-flight turn (TestCompaction_AboveThreshold_SummarizesOldTurnsOnly)
+  # - non-destructive on failure (TestCompaction_SummarizerError_NonDestructive)
+  # - update, not append — summary AND Details both (TestCompaction_ReCompaction_*,
+  #   TestCompaction_TypedResult_DetailsMergeAcrossRounds)
+  "the summary's own internal section shape (Goal/Progress/Decisions/Errors-and-Fixes/Next-Steps)
+   is still real latitude — unchanged from the original sketch"
+
+historyReplacer   # built, unexported — pkg/agent/hooks/compaction.go. Same two methods as
+                   # sessionSeeder above, independently declared in the hooks package (no shared
+                   # interface type between the two packages — both are satisfied by AgentBase's
+                   # same two promoted methods; not worth a shared declaration for two methods).
+  func SessionHistory(sessionID string) []llm.ChatMessage
+  func SeedSession(sessionID string, history []llm.ChatMessage)
+
+## Still only proposed — not built this pass
+
+TokenCounter   # proposed, see compaction-v2.md. Still blocked on the same gap noted in
+                # Compaction's own doc comment: AgentBase doesn't persist per-call Usage anywhere
+                # a hook can read it, so "walk history backward for the last valid usage" has
+                # nothing to walk yet. Both estimateMsgTokens (hooks package) and
+                # agentcontext/extended.go:305-326 still use the char/4 heuristic unmodified.
+  func CountFromUsage(usage llm.Usage) int
+  func EstimateFromText(s string) int
+
+"Phase 4 (deferred post-turn working-memory compaction, docs/roadmap.md) — not started. Phase 1's
+ session snapshot/restore (session-dispatch.md item 4) — not started either; Session today is
+ entirely in-memory, same durability as AgentBase's own session storage."
+
+## How the new pieces relate to each other
+
+SessionLog is the substrate for turn-scratch branching only — compaction does NOT operate on it.
+Compaction operates directly on AgentBase's flat per-session history via historyReplacer; turn
+branching operates on SessionLog via sessionSeeder, going through a disposable scratch AgentBase
+session to run each branch's turn. The two don't currently compose: a Session with both a
+SessionLog attached AND the agent's Compaction hook installed would have compaction summarizing
+the SCRATCH session's flat history mid-branch, not the spine's — this hasn't been tried or tested
+together. Flagged here rather than assumed to work.
+
+## The two original `??`, resolved
+
+1. "Whether CompressionHook (existing, Extended-shaped) gets extended to operate over an
+   arbitrary SessionLog path, or whether compactSpan is a free function an Extended-based
+   CompressionHook implementation calls internally" — resolved as neither: Compaction doesn't use
+   CompressionHook/Extended at all. It's a plain AgentHooks.PreModel hook operating directly on
+   AgentBase's own session history via historyReplacer (SessionHistory/SeedSession). Extended
+   remains unused by this branch's compaction path — a real, intentional divergence from the
+   original sketch, not an oversight.
+2. "Whether AgentBase keeps its own agentSession.history (flat) as a derived cache of
+   SessionLog.pathTo(leaf), or reads through SessionLog directly" — resolved as: AgentBase keeps
+   its own flat history, completely unaware SessionLog exists. Turn branching works entirely from
+   the OUTSIDE, at the Session layer: it seeds a disposable scratch AgentBase session from
+   SessionLog.Path(leaf) before a turn and reads the result back after, via SeedSession/
+   SessionHistory — AgentBase itself was changed only by adding those two accessor methods, not
+   by learning about SessionLog.

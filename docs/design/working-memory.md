@@ -87,3 +87,14 @@ it — or as a lighter-weight keyed store if `Extended` is too heavy.
   cover most real cases?
 - Should working memory back large items to disk automatically (like LangChain's
   virtual filesystem)?
+
+## Resolution (2026-10-15), see `compaction-v2.md`
+
+Phase-boundary flushing, with the boundary being the turn itself: `PostResponse` is the flush point.
+If nothing later in the same turn needed a `wm:` ref re-injected in full, the ref stands permanently
+instead of being re-expanded on the next turn — no explicit `wm_release` needed as the *default*
+path (still fine as an escape hatch for an agent that knows it's done with something mid-turn).
+This was motivated by a separate, later ask ("replace raw tool results with a compact version once
+the turn's answered") that turned out to be this same open question, just answered from the other
+direction. Doesn't resolve the disk-backing question or the `AgentBase`-vs-separate-component question
+above — those are still open.
