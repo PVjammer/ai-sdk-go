@@ -1,0 +1,122 @@
+name: repo-feature
+description: >
+  Cold-start, real-repo feature implementation: explore an unfamiliar package's conventions,
+  add a hook analogous to an existing one across several turns, plus a natural
+  "discover-the-right-path-then-reuse-it-later" probe. Reproduces the test that found the
+  compaction-threshold bug (a fraction-of-a-fraction that compacted turns using under 10% of
+  the model's real room) and the empty-branch-ref corruption bug — both fixed; see
+  pkg/agent/hooks/compaction.go and pkg/agent/session.go. Recall probes here are ordinary
+  follow-ups, not "without doing X again" instructions — real usage doesn't talk that way, and
+  forbidding a tool call makes every re-verification wrong by construction even when
+  re-checking would be the reasonable thing to do. What's interesting is what a model does
+  naturally, not whether it complies with an unusual directive.
+
+defaults:
+  endpoint: http://127.0.0.1:11434/v1
+  model: qwen3.8-96k
+  context_window: 98304      # qwen3.8-96k's REAL served context — verify this per model, don't
+                              # assume the architecture's advertised max (Ollama's num_ctx can
+                              # differ wildly from what a model reports).
+  compaction_reserve: 16384   # pi's actual default (DEFAULT_COMPACTION_SETTINGS.reserveTokens)
+  coding_tools: true
+  max_iterations: 50          # was hardcoded at 15 — a single explore-then-write-then-fix turn
+                              # can need that many rounds on its own once a file read over 8KB
+                              # costs two rounds (LargeResult's redirect-then-fetch), so 15 was
+                              # confounding "ran out of budget" with "stuck/incapable." 50 gives
+                              # real room to tell those apart; bump to 100 if turns still hit it.
+
+source:
+  type: git
+  repo: /home/nick/Workspace/src/github.com/PVjammer/AI-Projects/projects/ai-sdk-go
+  ref: HEAD
+
+turns:
+  # Natural "wrong path, discover, reuse later" probe: pkg/llm/usage.go is real; pkg/agent/usage.go
+  # is not (wrong directory, SAME filename — not a filename typo, which could get silently
+  # corrected into the final answer text, e.g. "found it, it's actually usage.go", without any
+  # real retrieval happening. A wrong directory makes the correction more likely to happen only
+  # in the tool-call sequence itself and never get restated in a clean final summary — which is
+  # exactly the branch-hidden content that matters for this test). Nothing else in this suite
+  # references pkg/llm/usage.go, so nothing else reinforces the correct path for free. The model
+  # has to hit a file-not-found error, explore to find the real file, and fix it — then, 10
+  # turns later, we ask for another edit to "that same file" with no path restated at all, and
+  # see whether it goes straight there, has to rediscover it, or regresses to the wrong path
+  # again.
+  - prompt: >
+      Add a short doc comment to the top of pkg/agent/usage.go explaining what the file is
+      for.
+  - prompt: >
+      This is an existing Go project you haven't seen before. Explore the pkg/agent/hooks
+      package (use list_files and read_file) to understand its existing conventions before
+      writing anything -- look at context.go in particular for the TokenLimit hook's style.
+      Then add a new hook function WordCountLimit(maxWords int) agent.AgentHooks in a NEW file
+      pkg/agent/hooks/wordcount.go, analogous to TokenLimit but counting words instead of
+      estimated tokens, dropping oldest complete exchanges until under maxWords. Match the
+      existing code's doc-comment and error-handling style exactly. Write a test file following
+      the existing test file's conventions. Run go test on package "./pkg/agent/hooks" and fix
+      anything that fails until it passes.
+  - prompt: >
+      Add a MinWords safety floor: WordCountLimit should never drop history below MinWords of
+      trailing content. Update your tests. Run tests again, fixing anything that fails.
+  - prompt: >
+      Check how hooks are typically combined or documented elsewhere in this codebase (look at
+      examples/tui-agent or the hooks package's own doc comments for patterns like
+      hooks.Combine). Add a short doc comment on WordCountLimit explaining when someone would
+      pick it over TokenLimit, following whatever convention you find.
+  - prompt: >
+      Run go test on the WHOLE module (package "./...") to make sure nothing else in the
+      project broke.
+  - prompt: >
+      In one sentence, what heuristic does the existing TokenLimit hook use to estimate token
+      count from a message?
+  - prompt: >
+      Describe the exact drop condition your WordCountLimit hook uses to decide when to stop
+      dropping exchanges -- be precise, including the MinWords floor.
+  - prompt: >
+      Add a third hook, WordCountLimitWithStats, which behaves like WordCountLimit but also
+      reports how many exchanges were dropped each time it runs, via a callback -- follow
+      whatever callback pattern you've seen elsewhere in this codebase (for example, the
+      compaction hook has an OnCompaction callback). Add a test. Run the package tests again,
+      fixing anything that fails.
+  - prompt: >
+      Run go test on the whole module again to confirm everything still passes.
+  - prompt: >
+      What existing callback pattern in this codebase did you model your new drop-count
+      callback after? Name the hook and its callback field.
+  - prompt: >
+      Now also add a one-line note to that same usage file's doc comment mentioning it's used
+      by the compaction hook to track per-call usage.
+  - prompt: >
+      Summarize in 2-3 sentences everything you added to this project in this session.
+
+cases:
+  - name: qwen-branch-on
+    model: qwen3.8-96k
+    context_window: 98304
+    branching: true
+    replicates: 2
+  - name: qwen-branch-off
+    model: qwen3.8-96k
+    context_window: 98304
+    branching: false
+    replicates: 2
+  - name: gemma-branch-on
+    model: gemma4-131k
+    context_window: 131072
+    branching: true
+    replicates: 2
+  - name: gemma-branch-off
+    model: gemma4-131k
+    context_window: 131072
+    branching: false
+    replicates: 2
+  - name: llama32-branch-on
+    model: llama32-64k
+    context_window: 65536
+    branching: true
+    replicates: 2
+  - name: llama32-branch-off
+    model: llama32-64k
+    context_window: 65536
+    branching: false
+    replicates: 2

@@ -1,0 +1,70 @@
+name: daily-driver
+description: >
+  Lightweight, quick-lookup "personal assistant" workload: many short single-tool-call turns
+  (doc search, simulated web search, notes) rather than few tool-heavy ones, with recall probes
+  spaced through it. Reproduces the test that showed branching's savings scale with how much
+  tool-call volume a turn generates — real but smaller here than on repo-feature.yaml's
+  exploration-heavy turns. Recall probes are ordinary follow-ups, not "without doing X again"
+  instructions — no real user talks that way, and forbidding the tool call makes any
+  re-verification wrong by construction even when re-checking would be reasonable. What's
+  actually interesting is whether it answers from memory or re-fetches, and whether the answer
+  is right either way — not literal compliance with an unusual directive.
+
+defaults:
+  endpoint: http://127.0.0.1:11434/v1
+  model: gemma4-131k
+  context_window: 131072
+  compaction_reserve: 16384
+  assistant_tools: true
+  experiment_tools: true
+  docs_dir: /home/nick/Workspace/src/github.com/PVjammer/AI-Projects/projects/ai-sdk-go/docs/design
+  max_iterations: 50
+
+source:
+  type: scratch
+
+turns:
+  - prompt: 'Search the project docs for "turn-scratch branching" and tell me in one sentence what it is.'
+  - prompt: 'Search the project docs for "compaction" and tell me in one sentence what threshold triggers it.'
+  - prompt: 'Search the web for "exponential backoff" and summarize it in one sentence.'
+  - prompt: "What time is it?"
+  - prompt: "Write a note called reminder.md that says: follow up on the wordcount hook PR by Friday."
+  - prompt: 'Search the web for "lru cache" and summarize it in one sentence.'
+  - prompt: 'Search the project docs for "working memory" and tell me in one sentence what it covers.'
+  - prompt: "Look up the fact for gamma using lookup_fact."
+  - prompt: 'Search the web for "rate limiting algorithm" and name the three approaches mentioned.'
+  - prompt: "What threshold triggers compaction, per what you found earlier?"
+  - prompt: 'Search the project docs for "roadmap" and tell me one phase mentioned.'
+  - prompt: "What time is it now?"
+  - prompt: 'Search the web for "context window" and summarize it in one sentence.'
+  - prompt: "What did reminder.md say again?"
+  - prompt: 'Search the project docs for "SessionLog" and tell me one thing it does.'
+  - prompt: "Remind me what the three rate-limiting approaches you found earlier were."
+
+cases:
+  - name: gemma-branch-on
+    branching: true
+    replicates: 2
+  - name: gemma-branch-off
+    branching: false
+    replicates: 2
+  - name: qwen-branch-on
+    model: qwen3.8-96k
+    context_window: 98304
+    branching: true
+    replicates: 2
+  - name: qwen-branch-off
+    model: qwen3.8-96k
+    context_window: 98304
+    branching: false
+    replicates: 2
+  - name: llama32-branch-on
+    model: llama32-64k
+    context_window: 65536
+    branching: true
+    replicates: 2
+  - name: llama32-branch-off
+    model: llama32-64k
+    context_window: 65536
+    branching: false
+    replicates: 2

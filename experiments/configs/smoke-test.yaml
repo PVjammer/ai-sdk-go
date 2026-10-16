@@ -1,0 +1,23 @@
+name: smoke-test
+description: "Two quick turns, scratch source, no git — just proving the runner's plumbing works."
+
+defaults:
+  endpoint: http://127.0.0.1:11434/v1
+  model: gemma4-131k
+  context_window: 131072
+  compaction_reserve: 16384
+  experiment_tools: true
+
+source:
+  type: scratch
+
+turns:
+  - prompt: "Look up the fact for alpha using lookup_fact."
+  - prompt: "Without calling lookup_fact again, what was alpha's value?"
+    forbidden_tools: ["lookup_fact"]
+
+cases:
+  - name: branch-on
+    branching: true
+  - name: branch-off
+    branching: false

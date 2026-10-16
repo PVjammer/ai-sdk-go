@@ -58,6 +58,15 @@ type agentSession struct {
 	mu           sync.Mutex
 	history      []llm.ChatMessage
 	lastAccessed time.Time
+
+	// promptTokens/completionTokens accumulate across every LLM call this session has ever
+	// made — every tool-call round included, not just the turn's final response, since each
+	// round is its own full request with its own usage. For a flat (non-branching) session
+	// this grows for the session's whole lifetime; callers wanting one turn's cost take a
+	// before/after snapshot (see Session's usage tracking in session.go). For a branching
+	// scratch session, which is fresh per turn, the running total already IS that turn's cost.
+	promptTokens     int
+	completionTokens int
 }
 
 // InitBase initializes AgentBase fields. Must be called by concrete agents in New().
@@ -202,12 +211,31 @@ func (b *AgentBase) ClearSession(sessionID string) {
 // prime a scratch session with a path through a SessionLog before running a turn against it —
 // the scratch session is otherwise an ordinary AgentBase session and sees normal hook
 // processing on its next Run().
+//
+// Also called mid-turn by the Compaction hook's PreModel, from inside executeAgentLoop, on the
+// same goroutine that's running the turn — this matters: if a session with this ID already
+// exists, SeedSession mutates its history field IN PLACE rather than allocating a new
+// *agentSession and replacing the map entry. executeAgentLoop holds its own *agentSession
+// pointer for the whole turn (grabbed once before the loop starts) and keeps appending to it
+// every round; swapping in a new object here would silently detach that pointer from
+// b.sessions[sessionID], so every tool call and the final answer appended for the rest of that
+// turn would never be visible to a later SessionHistory call — found live: turn-branching's
+// sendBranched would read back a branch missing everything after the compaction point. Only
+// when no session exists yet (SeedSession's first call priming a scratch session before Run()
+// has ever been called for it) is there no stale pointer to worry about, so a new object is
+// fine there.
 func (b *AgentBase) SeedSession(sessionID string, history []llm.ChatMessage) {
 	b.sessionsMu.Lock()
 	defer b.sessionsMu.Unlock()
 
 	seeded := make([]llm.ChatMessage, len(history))
 	copy(seeded, history)
+
+	if s, ok := b.sessions[sessionID]; ok {
+		s.history = seeded
+		s.lastAccessed = time.Now()
+		return
+	}
 	b.sessions[sessionID] = &agentSession{
 		history:      seeded,
 		lastAccessed: time.Now(),
@@ -228,6 +256,21 @@ func (b *AgentBase) SessionHistory(sessionID string) []llm.ChatMessage {
 	out := make([]llm.ChatMessage, len(s.history))
 	copy(out, s.history)
 	return out
+}
+
+// SessionUsage returns the running total of prompt/completion tokens across every LLM call a
+// session has made over its whole lifetime — every tool-call round, not just final responses.
+// For a flat session that lives across many turns, isolating one turn's cost means snapshotting
+// this before and after that turn (see Session in session.go, which does exactly that).
+func (b *AgentBase) SessionUsage(sessionID string) (promptTokens, completionTokens int) {
+	b.sessionsMu.RLock()
+	defer b.sessionsMu.RUnlock()
+
+	s, ok := b.sessions[sessionID]
+	if !ok {
+		return 0, 0
+	}
+	return s.promptTokens, s.completionTokens
 }
 
 // StartAutoCleanup starts a background goroutine to remove stale sessions.
@@ -419,6 +462,8 @@ func (b *AgentBase) executeAgentLoop(
 				finalChunk = chunk
 			}
 		}
+		session.promptTokens += finalChunk.PromptTokens
+		session.completionTokens += finalChunk.CompletionTokens
 
 		// ── Hook: PostModel ────────────────────────────────────────────────
 		if b.hooks.PostModel != nil {

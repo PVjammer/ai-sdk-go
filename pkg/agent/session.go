@@ -18,6 +18,7 @@ type sessionSeeder interface {
 	SeedSession(sessionID string, history []llm.ChatMessage)
 	SessionHistory(sessionID string) []llm.ChatMessage
 	ClearSession(sessionID string)
+	SessionUsage(sessionID string) (promptTokens, completionTokens int)
 }
 
 // Session wraps an AIAgent and owns one session's lifecycle: steering, follow-up queuing, and
@@ -50,6 +51,17 @@ type Session struct {
 
 	followUpMu sync.Mutex
 	followUp   []string
+
+	usageMu    sync.Mutex
+	lastUsage  TurnUsage // the most recently completed Send's own token cost, isolated from
+	                     // every other turn before or after it — see sendOnce/sendBranched.
+}
+
+// TurnUsage is one turn's own prompt/completion token cost, summed across every LLM round that
+// turn made (tool-call rounds included, not just the final response).
+type TurnUsage struct {
+	PromptTokens     int
+	CompletionTokens int
 }
 
 // SessionConfig configures a new Session.
@@ -106,6 +118,22 @@ func (s *Session) Leaf() string {
 
 // Log returns the attached SessionLog, or nil if branching is disabled.
 func (s *Session) Log() *SessionLog { return s.log }
+
+// LastTurnUsage returns the token cost of the most recently completed Send — not a running
+// total across the whole session, just that one turn, isolated the same way regardless of
+// whether branching is on (where the scratch session already starts at zero) or off (where the
+// main session's running total is snapshotted before and after, see sendOnce).
+func (s *Session) LastTurnUsage() TurnUsage {
+	s.usageMu.Lock()
+	defer s.usageMu.Unlock()
+	return s.lastUsage
+}
+
+func (s *Session) setLastUsage(u TurnUsage) {
+	s.usageMu.Lock()
+	defer s.usageMu.Unlock()
+	s.lastUsage = u
+}
 
 // Steer injects a message to be spliced in as soon as the current tool-call batch finishes,
 // redirecting the agent without aborting the current turn. Non-blocking: if the steer buffer is
@@ -202,7 +230,18 @@ func chainPreModel(first, base AgentHooks) AgentHooks {
 // sendOnce runs exactly one turn (no follow-up draining) and forwards its events to out.
 func (s *Session) sendOnce(ctx context.Context, message string, out chan<- Event) {
 	if s.log == nil || s.seeder == nil {
+		// Flat mode's session lives for the whole conversation, not just one turn, so
+		// isolating this turn's own cost means snapshotting the running total before and
+		// after — unlike sendBranched's scratch session, which already starts at zero.
+		var before TurnUsage
+		if s.seeder != nil { // nil only if the agent genuinely doesn't implement SessionUsage
+			before.PromptTokens, before.CompletionTokens = s.seeder.SessionUsage(s.id)
+		}
 		forward(s.agent.Run(ctx, s.id, message), out)
+		if s.seeder != nil {
+			afterP, afterC := s.seeder.SessionUsage(s.id)
+			s.setLastUsage(TurnUsage{PromptTokens: afterP - before.PromptTokens, CompletionTokens: afterC - before.CompletionTokens})
+		}
 		return
 	}
 	s.sendBranched(ctx, message, out)
@@ -246,14 +285,37 @@ func (s *Session) sendBranched(ctx context.Context, message string, out chan<- E
 	}
 
 	full := s.seeder.SessionHistory(scratchID)
+	// The scratch session started at zero (SeedSession always creates a fresh *agentSession
+	// for a never-before-seen scratchID), so its running total right now already IS this
+	// turn's own cost — no before/after delta needed, unlike sendOnce's flat-session case.
+	usageP, usageC := s.seeder.SessionUsage(scratchID)
+	s.setLastUsage(TurnUsage{PromptTokens: usageP, CompletionTokens: usageC})
 	s.seeder.ClearSession(scratchID)
 
 	// full = seedHistory + this turn's new messages (the user message, any assistant/tool
 	// rounds, the final assistant message). Replay only the new portion into the log as real
 	// Entries — the branch is always recorded, regardless of which outcome below applies.
+	//
+	// This is a length-based diff. It used to be unsafe against anything that rewrites the
+	// scratch session's history mid-turn: SeedSession (called by Compaction's PreModel from
+	// inside executeAgentLoop) used to allocate a brand-new *agentSession and swap the map
+	// entry, silently detaching the *agentSession pointer executeAgentLoop already held for
+	// the rest of the turn — every tool call and the final answer appended afterward went to
+	// an object SessionHistory could no longer see. SeedSession now mutates an existing
+	// session's history in place instead (base.go), which fixes that at the root: full is
+	// always complete now. What's left here is a narrower, honest case: compaction can
+	// legitimately shrink the message COUNT below len(seedHistory) by replacing many old
+	// messages with one summary, even though real new content exists after that point. In
+	// that case full[len(seedHistory):] isn't the right slice either, so fall back to
+	// replaying the whole of full — it may duplicate a little content the trunk already has,
+	// which is harmless, rather than trying to be clever about exactly where the new part
+	// starts.
 	newMsgs := full
 	if len(seedHistory) <= len(full) {
 		newMsgs = full[len(seedHistory):]
+		if len(newMsgs) == 0 && toolCalls > 0 {
+			newMsgs = full
+		}
 	}
 
 	cursor := trunkLeaf

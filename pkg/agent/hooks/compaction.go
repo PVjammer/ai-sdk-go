@@ -117,6 +117,17 @@ type CompactionOptions struct {
 	MaxTokens int
 
 	// Threshold is the fraction of MaxTokens that triggers compaction (default 0.75).
+	//
+	// If you're computing MaxTokens yourself as some fraction of a model's real context
+	// window, set Threshold to 1.0 explicitly rather than leaving it at the 0.75 default.
+	// Otherwise the two fractions multiply — found live: examples/tui-agent originally
+	// computed MaxTokens as contextWindow*0.75, then this field's own default 0.75 applied on
+	// top of that, so compaction actually triggered at ~0.56 of the real window, and for one
+	// run that was low enough to be under 10% of what the model actually had room for. Fixed
+	// at that one call site (Threshold: 1.0), not here, since MaxTokens already being a
+	// deliberately-conservative sub-budget (the TokenLimit hard-backstop pattern) is a
+	// legitimate use of this field as documented — the bug was stacking two independent
+	// safety margins without realizing it, not this field's default being wrong.
 	Threshold float64
 
 	// ExtractFileOps builds CompactionDetails from each tool call in the span being compacted.
@@ -206,6 +217,19 @@ func Compaction(base historyReplacer, summarizer llm.Provider, opts CompactionOp
 			if hasPrev {
 				previousSummary = prev.Summary
 				previousDetails = prev.Details
+			}
+
+			// Nothing new since the last compaction — compactable is just the marker itself,
+			// nothing followed it. Re-running the summarizer here would produce the same
+			// summary over unchanged input, for no benefit, every single round. That's not
+			// just waste: found live on a real task, repeated no-op compaction on a turn whose
+			// OWN in-flight content already exceeds the budget (which compaction, by design,
+			// never touches — see the turn-boundary comment below) burned an extra LLM call
+			// every iteration of a stuck loop, which is what actually exhausted
+			// ErrMaxIterations faster than the stuck loop alone would have. Skipping it doesn't
+			// fix a model getting stuck, but it stops compaction from making a stuck turn worse.
+			if len(rest) == 0 {
+				return messages, nil
 			}
 
 			read, modified := extractFileOps(rest, opts.ExtractFileOps)

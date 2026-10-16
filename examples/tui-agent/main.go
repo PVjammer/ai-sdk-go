@@ -52,6 +52,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/pvjammer/ai-sdk-go/internal/experiment"
 	"github.com/pvjammer/ai-sdk-go/pkg/agent"
 	"github.com/pvjammer/ai-sdk-go/pkg/agent/hooks"
 	"github.com/pvjammer/ai-sdk-go/pkg/function"
@@ -62,7 +63,8 @@ import (
 // methods it doesn't provide on its own (see pkg/builtin/agents/simple for the same pattern).
 type tuiAgent struct {
 	agent.AgentBase
-	branchAware bool // true when branching is on and read_branch is actually registered
+	branchAware   bool // true when branching is on and read_branch is actually registered
+	maxIterations int
 }
 
 func (a *tuiAgent) Metadata() *agent.AgentMetadata {
@@ -70,7 +72,7 @@ func (a *tuiAgent) Metadata() *agent.AgentMetadata {
 }
 func (a *tuiAgent) Config() function.Config { return function.NilConfig{} }
 func (a *tuiAgent) Run(ctx context.Context, sessionID, message string) <-chan agent.Event {
-	return a.BaseRun(ctx, sessionID, message, a.systemPrompt(), 15, false)
+	return a.BaseRun(ctx, sessionID, message, a.systemPrompt(), a.maxIterations, false)
 }
 
 func (a *tuiAgent) systemPrompt() string {
@@ -115,16 +117,37 @@ func main() {
 		"endpoint/server, don't assume the architecture's advertised max (see ai-sdk-go session notes on Ollama's "+
 		"num_ctx vs. a model's reported context_length). Compaction's protected budget is a fraction of this, not a "+
 		"flat number, so it scales with whatever model you actually point --endpoint/--model at.")
-	compactionFraction := flag.Float64("compaction-fraction", 0.75, "fraction of --context-window compaction's "+
-		"protected budget uses (pi's analogous default reserves a fixed ~16K-token margin instead of a fraction; "+
-		"a fraction is simpler to reason about and scales the same way across very different context sizes)")
+	compactionReserve := flag.Int("compaction-reserve", 16384, "trigger compaction once estimated tokens come "+
+		"within this many tokens of --context-window — pi's actual algorithm (DEFAULT_COMPACTION_SETTINGS."+
+		"reserveTokens=16384), not a fraction. An earlier version of this flag multiplied a fraction of a "+
+		"fraction (Threshold x (contextWindow x compaction-fraction)), which compacted far earlier than "+
+		"intended and was never caught because the only tests run used a --context-window far below the "+
+		"model's real size, where that double-shrink didn't matter. At a model's real size it does: it was "+
+		"triggering compaction on turns using under 10% of the model's actual room.")
 	experimentTools := flag.Bool("experiment-tools", false, "register lookup_fact, a test-only tool for the "+
 		"branching-on-vs-off comparison (see experiment_tools.go)")
 	codingTools := flag.Bool("coding-tools", false, "register write_file/read_file/list_files/run_go_test, "+
 		"scoped to a per-session scratch Go module, for a real multi-turn implementation task (see coding_tools.go)")
+	assistantTools := flag.Bool("assistant-tools", false, "register doc_search/web_search for the quick-lookup "+
+		"\"daily driver\" comparison (see assistant_tools.go); web_search is a simulated stand-in, not live")
+	docsDir := flag.String("docs-dir", "", "directory doc_search greps (.md files, recursively); required with --assistant-tools")
+	metricsFile := flag.String("metrics-file", "", "append one structured JSON line per one-shot turn here (see metrics.go) — "+
+		"for cmd/experiment-runner; no effect in REPL mode")
+	maxIterations := flag.Int("max-iterations", 15, "max tool-call rounds per turn before BaseRun gives up with "+
+		"ErrMaxIterations — was hardcoded at 15; a multi-step turn (explore several files, write, test, fix) can "+
+		"burn through that fast, and an exhausted budget looks identical in the logs to a model stuck in a loop, "+
+		"so this needs to be a known, changeable number, not a buried literal, to tell those apart.")
 	sessionID := flag.String("session", "tui", "session identifier — reused across invocations to continue it")
 	sessionDir := flag.String("session-dir", defaultSessionDir(), "directory session files are saved/loaded from")
 	flag.Parse()
+	if *maxIterations <= 0 {
+		// base.go's loop is `for i := 0; i < maxIterations; i++` — zero or negative means the
+		// model is never even called, and the resulting ErrMaxIterations is indistinguishable
+		// in the logs/metrics from a model genuinely stuck in a loop. Catch the
+		// misconfiguration here instead of letting it masquerade as that.
+		fmt.Fprintf(os.Stderr, "--max-iterations must be positive, got %d\n", *maxIterations)
+		os.Exit(1)
+	}
 	oneShotMessage := strings.Join(flag.Args(), " ")
 
 	apiKey := os.Getenv("AI_SDK_API_KEY")
@@ -138,7 +161,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	a := &tuiAgent{branchAware: *branching}
+	a := &tuiAgent{branchAware: *branching, maxIterations: *maxIterations}
 	a.InitBase(function.NilConfig{})
 	a.SetProvider(provider)
 
@@ -186,6 +209,21 @@ func main() {
 			}
 		}
 	}
+	if *assistantTools {
+		if *docsDir == "" {
+			fmt.Fprintln(os.Stderr, "--assistant-tools requires --docs-dir")
+			os.Exit(1)
+		}
+		if err := a.RegisterTool(newDocSearchTool(*docsDir)); err != nil {
+			fmt.Fprintf(os.Stderr, "register doc_search: %v\n", err)
+			os.Exit(1)
+		}
+		webSearchLog := filepath.Join(notesDir, "web_search.log")
+		if err := a.RegisterTool(newWebSearchTool(webSearchLog)); err != nil {
+			fmt.Fprintf(os.Stderr, "register web_search: %v\n", err)
+			os.Exit(1)
+		}
+	}
 
 	loaded, found := loadSession(*sessionDir, *sessionID)
 	if found && loaded.branching != *branching {
@@ -216,22 +254,28 @@ func main() {
 		a.SeedSession(*sessionID, loaded.history)
 	}
 
-	// compactionBudget is the protected budget compaction triggers against — a FRACTION of the
-	// model's real context window, not a flat number, so it scales with whatever you actually
-	// point --endpoint/--model at instead of silently becoming a tiny sliver of a 96K+ model's
-	// real room (see ai-sdk-go session notes: the old flat 4000-token default was triggering
-	// compaction on nearly every round for any model with real headroom, which is what caused
-	// the repeated-compaction tool-call loop found during stress testing).
-	compactionBudget := int(float64(*contextWindow) * *compactionFraction)
+	// compactionBudget is the protected budget compaction triggers against — contextWindow minus
+	// a fixed reserve (pi's actual algorithm), not a fraction, so it scales with whatever model
+	// you actually point --endpoint/--model at instead of silently becoming a tiny sliver of a
+	// 96K+ model's real room. Threshold is pinned to 1.0 so the hook's own
+	// Threshold-fraction-of-MaxTokens math doesn't shrink this a second time — MaxTokens here
+	// IS the trigger point already, not a ceiling a fraction gets taken of.
+	compactionBudget := *contextWindow - *compactionReserve
+	if compactionBudget < 256 {
+		compactionBudget = 256
+	}
 	// hardLimit is the backstop if compaction can't keep up — just under the model's REAL
 	// ceiling (not a multiple of compactionBudget, which would exceed contextWindow and defeat
 	// the point of a backstop), leaving a little headroom for the response itself.
 	hardLimit := int(float64(*contextWindow) * 0.95)
 
+	var compactionsThisTurn []experiment.CompactionMetric
+
 	var hs []agent.AgentHooks
 	if *compact {
 		hs = append(hs, hooks.Compaction(&a.AgentBase, provider, hooks.CompactionOptions{
 			MaxTokens: compactionBudget,
+			Threshold: 1.0,
 			OnCompaction: func(sessionID string, result hooks.CompactionResult) {
 				fmt.Printf("\n[compacted] %d -> ~%d tokens", result.TokensBefore, result.EstimatedTokensAfter)
 				if len(result.Details.ReadFiles) > 0 {
@@ -241,6 +285,10 @@ func main() {
 					fmt.Printf("  modified: %v", result.Details.ModifiedFiles)
 				}
 				fmt.Println()
+				compactionsThisTurn = append(compactionsThisTurn, experiment.CompactionMetric{
+					TokensBefore: result.TokensBefore,
+					TokensAfter:  result.EstimatedTokensAfter,
+				})
 			},
 		}))
 	}
@@ -257,10 +305,25 @@ func main() {
 	}
 
 	if oneShotMessage != "" {
-		fmt.Fprintf(os.Stderr, "[config] model=%s branching=%v compaction=%v budget=%d window=%d\n",
-			*model, *branching, *compact, compactionBudget, *contextWindow)
+		fmt.Fprintf(os.Stderr, "[config] model=%s branching=%v compaction=%v budget=%d window=%d max_iterations=%d\n",
+			*model, *branching, *compact, compactionBudget, *contextWindow, *maxIterations)
 		fmt.Print("agent> ")
-		runTurn(context.Background(), sess, oneShotMessage)
+		start := time.Now()
+		calls, errMsg, responseChars := runTurn(context.Background(), sess, oneShotMessage)
+		usage := sess.LastTurnUsage()
+		if err := appendMetrics(*metricsFile, experiment.TurnMetric{
+			Timestamp:        start.UTC().Format(time.RFC3339Nano),
+			DurationMS:       time.Since(start).Milliseconds(),
+			Message:          oneShotMessage,
+			ToolCalls:        calls,
+			Compactions:      compactionsThisTurn,
+			Error:            errMsg,
+			ResponseChars:    responseChars,
+			PromptTokens:     usage.PromptTokens,
+			CompletionTokens: usage.CompletionTokens,
+		}); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: could not write metrics: %v\n", err)
+		}
 		persist()
 		return
 	}
@@ -320,12 +383,16 @@ func runREPL(sess *agent.Session, log *agent.SessionLog, persist func()) {
 	}
 }
 
-func runTurn(ctx context.Context, sess *agent.Session, message string) {
+// runTurn prints the turn's events as before, and additionally returns a structured summary
+// (tool calls made, error if any, final response length) for --metrics-file.
+func runTurn(ctx context.Context, sess *agent.Session, message string) (calls []experiment.ToolCallMetric, errMsg string, responseChars int) {
 	for ev := range sess.Send(ctx, message) {
 		switch ev.Type {
 		case agent.EventToolCall:
 			tc := ev.Data.(agent.ToolCallEvent)
 			fmt.Printf("\n  [tool call] %s(%v)\n", tc.ToolName, tc.Input)
+			args, _ := tc.Input.(map[string]interface{})
+			calls = append(calls, experiment.ToolCallMetric{Name: tc.ToolName, Args: args})
 
 		case agent.EventToolResult:
 			tr := ev.Data.(agent.ToolResultEvent)
@@ -339,13 +406,16 @@ func runTurn(ctx context.Context, sess *agent.Session, message string) {
 			r := ev.Data.(agent.ResponseEvent)
 			if r.Done {
 				fmt.Println(r.Content)
+				responseChars = len(r.Content)
 			}
 
 		case agent.EventError:
 			ee := ev.Data.(agent.ErrorEvent)
 			fmt.Fprintf(os.Stderr, "\n[error] %v\n", ee.Error)
+			errMsg = ee.Error.Error()
 		}
 	}
+	return calls, errMsg, responseChars
 }
 
 func printLog(log *agent.SessionLog, leaf string) {
